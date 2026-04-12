@@ -273,6 +273,160 @@ class IndicatorCalculator:
     
     # ==================== 量化多头指标 ====================
     
+    def get_market_divergence_indicators(self):
+        """计算一九行情指标 —— 市值加权收益 vs 等权收益差值
+        
+        通过比较全A股票的市值加权日收益率与等权日收益率的差值，
+        衡量市场收益是否集中在少数大市值股票上。
+        差值为正且偏大时，说明大盘股涨、多数个股不涨，即一九行情。
+        """
+        indicators = {}
+        
+        try:
+            end_date = dt.datetime.now().strftime('%Y-%m-%d')
+            
+            # 获取中证全指成分股作为全A代表
+            stocks = get_index_stocks('000985.XSHG')
+            if not stocks or len(stocks) == 0:
+                print("获取中证全指成分股失败")
+                return indicators
+            
+            # 获取所有成分股当日市值
+            q = query(
+                valuation.code,
+                valuation.market_cap
+            ).filter(
+                valuation.market_cap != None,
+                valuation.code.in_(stocks)
+            )
+            df_cap = get_fundamentals(q, end_date)
+            
+            if df_cap is None or df_cap.empty:
+                print("获取市值数据失败")
+                return indicators
+            
+            df_cap = df_cap.dropna(subset=['market_cap'])
+            valid_stocks = df_cap['code'].tolist()
+            
+            if len(valid_stocks) == 0:
+                return indicators
+            
+            # 获取近252+1个交易日的收盘价用于计算历史分位数
+            # +1是因为计算日收益率需要前一天的数据
+            history_period = 253
+            df_prices = get_price(
+                valid_stocks, count=history_period,
+                end_date=end_date, frequency='daily',
+                fields=['close'], panel=False
+            )
+            
+            if df_prices is None or df_prices.empty:
+                print("获取个股价格数据失败")
+                return indicators
+            
+            # 透视为 日期×股票 的收盘价矩阵
+            price_matrix = df_prices.pivot(index='time', columns='code', values='close')
+            price_matrix = price_matrix.sort_index()
+            
+            # 计算日收益率
+            returns_matrix = price_matrix.pct_change().dropna(how='all')
+            
+            if returns_matrix.empty:
+                return indicators
+            
+            # 构建市值权重（使用最新市值作为权重，对历史序列保持一致）
+            cap_dict = df_cap.set_index('code')['market_cap']
+            common_stocks = returns_matrix.columns.intersection(cap_dict.index)
+            returns_matrix = returns_matrix[common_stocks]
+            weights = cap_dict[common_stocks]
+            weights = weights / weights.sum()
+            
+            # 逐日计算市值加权收益和等权收益
+            cap_weighted_returns = returns_matrix.multiply(weights, axis=1).sum(axis=1)
+            # 等权收益：每日所有有效股票的平均收益
+            equal_weighted_returns = returns_matrix.mean(axis=1)
+            
+            # 分化度 = 市值加权 - 等权（正值表示大盘股跑赢多数个股）
+            divergence_series = (cap_weighted_returns - equal_weighted_returns) * 100
+            
+            # --- 当日分化度 ---
+            latest_divergence = divergence_series.iloc[-1]
+            indicators['market_divergence_daily'] = round(latest_divergence, 4)
+            
+            # --- 近20日累计分化度（滚动求和） ---
+            if len(divergence_series) >= 20:
+                divergence_20d = divergence_series.tail(20).sum()
+                indicators['market_divergence_20d'] = round(divergence_20d, 4)
+            
+            # --- 分化度的历史分位数（用20日累计分化度的滚动窗口） ---
+            if len(divergence_series) >= 40:
+                rolling_20d = divergence_series.rolling(window=20).sum().dropna()
+                percentile, days = self.calculate_percentile_with_days(rolling_20d, window=252, min_days=20)
+                if percentile is not None:
+                    indicators['market_divergence_percentile'] = percentile
+                    indicators['market_divergence_percentile_days'] = days
+            
+            # --- 一九行情指数（0-100综合评分） ---
+            yijiu_score = 50  # 基准分50，中性状态
+            
+            # 维度1：当日分化度（权重30%）
+            # 阈值：日分化度 > 0.05% 为轻度一九，> 0.15% 为明显一九
+            if latest_divergence > 0.15:
+                yijiu_score += 15
+            elif latest_divergence > 0.05:
+                yijiu_score += 8
+            elif latest_divergence < -0.15:
+                yijiu_score -= 15
+            elif latest_divergence < -0.05:
+                yijiu_score -= 8
+            
+            # 维度2：20日累计分化度（权重40%）
+            divergence_20d = indicators.get('market_divergence_20d', 0)
+            if divergence_20d > 2.0:
+                yijiu_score += 20
+            elif divergence_20d > 1.0:
+                yijiu_score += 12
+            elif divergence_20d > 0.3:
+                yijiu_score += 5
+            elif divergence_20d < -2.0:
+                yijiu_score -= 20
+            elif divergence_20d < -1.0:
+                yijiu_score -= 12
+            elif divergence_20d < -0.3:
+                yijiu_score -= 5
+            
+            # 维度3：历史分位数（权重30%）
+            pct = indicators.get('market_divergence_percentile')
+            if pct is not None:
+                if pct > 80:
+                    yijiu_score += 15
+                elif pct > 60:
+                    yijiu_score += 8
+                elif pct < 20:
+                    yijiu_score -= 15
+                elif pct < 40:
+                    yijiu_score -= 8
+            
+            yijiu_score = max(0, min(100, yijiu_score))
+            indicators['yijiu_index'] = yijiu_score
+            
+            # 生成文字描述
+            if yijiu_score >= 75:
+                indicators['yijiu_level'] = '强一九行情'
+            elif yijiu_score >= 60:
+                indicators['yijiu_level'] = '偏一九行情'
+            elif yijiu_score >= 40:
+                indicators['yijiu_level'] = '市场均衡'
+            elif yijiu_score >= 25:
+                indicators['yijiu_level'] = '偏九一行情'
+            else:
+                indicators['yijiu_level'] = '强九一行情'
+            
+        except Exception as e:
+            print(f"计算一九行情指标失败: {e}")
+        
+        return indicators
+    
     def get_quant_indicators(self):
         """获取量化多头指标"""
         indicators = {}
@@ -307,6 +461,13 @@ class IndicatorCalculator:
                         indicators[f'{name}_crowding'] = round(idx_amount / total_amount * 100, 2)
         except Exception as e:
             print(f"计算拥挤度失败: {e}")
+        
+        # 3. 一九行情分化指标
+        try:
+            divergence = self.get_market_divergence_indicators()
+            indicators.update(divergence)
+        except Exception as e:
+            print(f"获取一九行情指标失败: {e}")
         
         return indicators
     
@@ -828,6 +989,7 @@ class StrategyScorer:
             },
             'quant': {
                 'crowding': {'high': 20, 'low': 10},
+                'yijiu': {'strong_yijiu': 75, 'mild_yijiu': 60, 'balanced': 40, 'mild_jiuyi': 25},
             },
             'cta': {
                 'volatility': {'high': 25, 'low': 15},
@@ -920,7 +1082,7 @@ class StrategyScorer:
         try:
             quant_indicators = self.calculator.get_quant_indicators()
             
-            # 市场活跃度 (30%)
+            # 市场活跃度 (20%)
             market_amount = quant_indicators.get('market_amount_20d_avg', 8000)
             if market_amount > 10000:
                 score += 10
@@ -931,7 +1093,7 @@ class StrategyScorer:
             else:
                 details.append(f"成交正常({market_amount:.0f}亿): 0")
             
-            # 拥挤度 (70%)
+            # 拥挤度 (45%)
             crowding_1000 = quant_indicators.get('中证1000_crowding', 15)
             if crowding_1000 > self.thresholds['quant']['crowding']['high']:
                 score -= 15
@@ -941,6 +1103,40 @@ class StrategyScorer:
                 details.append(f"小盘拥挤度低({crowding_1000:.1f}%): +15")
             else:
                 details.append(f"小盘拥挤度正常({crowding_1000:.1f}%): 0")
+            
+            # 一九行情指数 (35%) - 强一九行情不利于量化多头策略
+            yijiu = quant_indicators.get('yijiu_index')
+            yijiu_level = quant_indicators.get('yijiu_level', '未知')
+            divergence_20d = quant_indicators.get('market_divergence_20d')
+            divergence_pct = quant_indicators.get('market_divergence_percentile')
+            
+            if yijiu is not None:
+                if yijiu >= 75:
+                    score -= 15
+                    pct_str = f", 分位{divergence_pct:.0f}%" if divergence_pct is not None else ""
+                    d20_str = f", 20日累计{divergence_20d:.2f}%" if divergence_20d is not None else ""
+                    details.append(f"一九行情指数({yijiu}分/{yijiu_level}{d20_str}{pct_str}): -15")
+                elif yijiu >= 60:
+                    score -= 8
+                    pct_str = f", 分位{divergence_pct:.0f}%" if divergence_pct is not None else ""
+                    d20_str = f", 20日累计{divergence_20d:.2f}%" if divergence_20d is not None else ""
+                    details.append(f"一九行情指数({yijiu}分/{yijiu_level}{d20_str}{pct_str}): -8")
+                elif yijiu <= 25:
+                    score += 10
+                    pct_str = f", 分位{divergence_pct:.0f}%" if divergence_pct is not None else ""
+                    d20_str = f", 20日累计{divergence_20d:.2f}%" if divergence_20d is not None else ""
+                    details.append(f"一九行情指数({yijiu}分/{yijiu_level}{d20_str}{pct_str}): +10")
+                elif yijiu <= 40:
+                    score += 5
+                    pct_str = f", 分位{divergence_pct:.0f}%" if divergence_pct is not None else ""
+                    d20_str = f", 20日累计{divergence_20d:.2f}%" if divergence_20d is not None else ""
+                    details.append(f"一九行情指数({yijiu}分/{yijiu_level}{d20_str}{pct_str}): +5")
+                else:
+                    pct_str = f", 分位{divergence_pct:.0f}%" if divergence_pct is not None else ""
+                    d20_str = f", 20日累计{divergence_20d:.2f}%" if divergence_20d is not None else ""
+                    details.append(f"一九行情指数({yijiu}分/{yijiu_level}{d20_str}{pct_str}): 0")
+            else:
+                details.append("一九行情指数数据不足: 0")
             
         except Exception as e:
             details.append(f"评分计算出错: {e}")
@@ -1701,19 +1897,75 @@ class ExcelReportGenerator:
             'market_amount_20d_avg': '近20日市场平均成交额，反映市场活跃度',
             '沪深300_crowding': '沪深300指数成交额占全市场比例（近20日），反映大盘拥挤度',
             '中证500_crowding': '中证500指数成交额占全市场比例（近20日），反映中盘拥挤度',
-            '中证1000_crowding': '中证1000指数成交额占全市场比例（近20日），反映小盘拥挤度'
+            '中证1000_crowding': '中证1000指数成交额占全市场比例（近20日），反映小盘拥挤度',
+            'market_divergence_daily': '当日市值加权收益与等权收益的差值，正值表示大盘股跑赢多数个股',
+            'market_divergence_20d': '近20日分化度累计值，持续正值表示一九行情持续',
+            'market_divergence_percentile': '20日累计分化度在近一年中的历史分位数',
+            'market_divergence_percentile_days': '计算分化度分位数所用的历史天数',
+            'yijiu_index': '一九行情综合指数（0-100），越高表示一九行情越明显',
+            'yijiu_level': '一九行情强度等级文字描述'
         }
         
         indicator_units = {
             'market_amount_20d_avg': '亿元',
             '沪深300_crowding': '%',
             '中证500_crowding': '%',
-            '中证1000_crowding': '%'
+            '中证1000_crowding': '%',
+            'market_divergence_daily': '%',
+            'market_divergence_20d': '%',
+            'market_divergence_percentile': '%',
+            'market_divergence_percentile_days': '天',
+            'yijiu_index': '分',
+            'yijiu_level': ''
         }
         
+        # 按逻辑分组显示，先展示原有指标，再展示一九行情指标
+        display_order = [
+            'market_amount_20d_avg',
+            '沪深300_crowding', '中证500_crowding', '中证1000_crowding',
+            'market_divergence_daily', 'market_divergence_20d',
+            'market_divergence_percentile', 'market_divergence_percentile_days',
+            'yijiu_index', 'yijiu_level'
+        ]
+        
         row = 4
-        for name, value in indicators.items():
+        thin_border = Border(
+            left=Side(style='thin'), right=Side(style='thin'),
+            top=Side(style='thin'), bottom=Side(style='thin')
+        )
+        
+        # 先按定义顺序输出
+        for name in display_order:
+            value = indicators.get(name)
             if value is not None:
+                ws.cell(row=row, column=1, value=name)
+                ws.cell(row=row, column=2, value=value)
+                ws.cell(row=row, column=3, value=indicator_units.get(name, ''))
+                ws.cell(row=row, column=4, value=indicator_descriptions.get(name, ''))
+                
+                # 一九行情指数高亮
+                if name == 'yijiu_index':
+                    yijiu_val = value
+                    if yijiu_val >= 75:
+                        ws.cell(row=row, column=2).fill = PatternFill(
+                            start_color='FF6B6B', end_color='FF6B6B', fill_type='solid')
+                    elif yijiu_val >= 60:
+                        ws.cell(row=row, column=2).fill = PatternFill(
+                            start_color='FFA07A', end_color='FFA07A', fill_type='solid')
+                    elif yijiu_val <= 25:
+                        ws.cell(row=row, column=2).fill = PatternFill(
+                            start_color='90EE90', end_color='90EE90', fill_type='solid')
+                
+                for col in range(1, 5):
+                    cell = ws.cell(row=row, column=col)
+                    cell.border = thin_border
+                    cell.alignment = Alignment(horizontal='left' if col in [1, 4] else 'center', vertical='center')
+                
+                row += 1
+        
+        # 输出其他未在 display_order 中的指标
+        for name, value in indicators.items():
+            if name not in display_order and value is not None:
                 ws.cell(row=row, column=1, value=name)
                 ws.cell(row=row, column=2, value=value)
                 ws.cell(row=row, column=3, value=indicator_units.get(name, ''))
@@ -1721,18 +1973,15 @@ class ExcelReportGenerator:
                 
                 for col in range(1, 5):
                     cell = ws.cell(row=row, column=col)
-                    cell.border = Border(
-                        left=Side(style='thin'), right=Side(style='thin'),
-                        top=Side(style='thin'), bottom=Side(style='thin')
-                    )
+                    cell.border = thin_border
                     cell.alignment = Alignment(horizontal='left' if col in [1, 4] else 'center', vertical='center')
                 
                 row += 1
         
-        ws.column_dimensions['A'].width = 30
+        ws.column_dimensions['A'].width = 35
         ws.column_dimensions['B'].width = 15
         ws.column_dimensions['C'].width = 10
-        ws.column_dimensions['D'].width = 50
+        ws.column_dimensions['D'].width = 60
     
     def _create_cta_sheet(self, wb, indicators):
         """创建CTA策略指标sheet - 仅商品期货 - 优化展示格式"""
@@ -2444,6 +2693,11 @@ def collect_all_indicators():
     quant = calculator.get_quant_indicators()
     all_indicators['quant'] = quant
     print(f"  - 拥挤度指标: {len([k for k in quant.keys() if 'crowding' in k])}个")
+    print(f"  - 一九行情指标: {len([k for k in quant.keys() if 'divergence' in k or 'yijiu' in k])}个")
+    yijiu_idx = quant.get('yijiu_index')
+    yijiu_lvl = quant.get('yijiu_level', '')
+    if yijiu_idx is not None:
+        print(f"  - 一九行情指数: {yijiu_idx}分 ({yijiu_lvl})")
     
     # 3. CTA指标（仅商品期货）
     print("\n[3/7] 收集CTA策略指标（商品期货）...")

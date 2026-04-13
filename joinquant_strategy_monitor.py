@@ -9,9 +9,8 @@ from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 import matplotlib
 try:
-    # 聚宽研究环境(Jupyter Notebook)使用 inline 后端
+    # 聚宽研究环境(Jupyter Notebook)：不设置后端，由 Jupyter 自动处理 inline 显示
     get_ipython()
-    matplotlib.use('module://matplotlib_inline.backend_inline')
 except NameError:
     # 非 Notebook 环境使用 Agg 后端（生成文件不弹窗）
     matplotlib.use('Agg')

@@ -8,7 +8,13 @@ import datetime as dt  # 使用别名避免冲突
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 import matplotlib
-matplotlib.use('Agg')
+try:
+    # 聚宽研究环境(Jupyter Notebook)使用 inline 后端
+    get_ipython()
+    matplotlib.use('module://matplotlib_inline.backend_inline')
+except NameError:
+    # 非 Notebook 环境使用 Agg 后端（生成文件不弹窗）
+    matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from matplotlib.font_manager import FontProperties
 
@@ -2960,6 +2966,7 @@ def plot_historical_scores(df_scores, save_path=None):
     
     fig.savefig(save_path, dpi=150, bbox_inches='tight')
     print(f"折线图已保存至: {save_path}")
+    plt.show()
     plt.close(fig)
     return save_path
 
@@ -2996,5 +3003,5 @@ if __name__ == "__main__":
     # 在聚宽研究环境中直接运行
     scores, indicators, excel_path = run_strategy_monitor(output_excel=True)
     
-    # 如需回溯过去10个交易日评分并绘制折线图，取消下方注释：
-    # df_history, chart_path = run_historical_analysis(n_days=10)
+    # 回溯过去10个交易日评分并绘制折线图
+    df_history, chart_path = run_historical_analysis(n_days=10)

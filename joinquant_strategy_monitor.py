@@ -1150,20 +1150,20 @@ class StrategyScorer:
             if oi_pct is not None and open_interest is not None:
                 if oi_pct >= 80:
                     score += 15
-                    details.append(f"持仓量指标高({open_interest:,.0f}, 分位{oi_pct:.0f}%, {oi_days}天): +15")
+                    details.append(f"库存/持仓指标高({open_interest:,.0f}, 分位{oi_pct:.0f}%, {oi_days}天): +15")
                 elif oi_pct >= 60:
                     score += 8
-                    details.append(f"持仓量指标偏高({open_interest:,.0f}, 分位{oi_pct:.0f}%, {oi_days}天): +8")
+                    details.append(f"库存/持仓指标偏高({open_interest:,.0f}, 分位{oi_pct:.0f}%, {oi_days}天): +8")
                 elif oi_pct <= 20:
                     score -= 10
-                    details.append(f"持仓量指标偏低({open_interest:,.0f}, 分位{oi_pct:.0f}%, {oi_days}天): -10")
+                    details.append(f"库存/持仓指标偏低({open_interest:,.0f}, 分位{oi_pct:.0f}%, {oi_days}天): -10")
                 elif oi_pct <= 40:
                     score -= 5
-                    details.append(f"持仓量指标略低({open_interest:,.0f}, 分位{oi_pct:.0f}%, {oi_days}天): -5")
+                    details.append(f"库存/持仓指标略低({open_interest:,.0f}, 分位{oi_pct:.0f}%, {oi_days}天): -5")
                 else:
-                    details.append(f"持仓量指标中性({open_interest:,.0f}, 分位{oi_pct:.0f}%, {oi_days}天): 0")
+                    details.append(f"库存/持仓指标中性({open_interest:,.0f}, 分位{oi_pct:.0f}%, {oi_days}天): 0")
             else:
-                details.append("持仓量指标数据不足: 0")
+                details.append("库存/持仓指标数据不足: 0")
             
         except Exception as e:
             details.append(f"评分计算出错: {e}")

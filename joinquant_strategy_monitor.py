@@ -2831,60 +2831,116 @@ def run_strategy_monitor(output_excel=True, excel_path=None, calc_date=None):
 
 
 # ============================================
-# 历史评分回溯与折线图
+# 历史评分回溯与折线图（周度）
 # ============================================
 
-def get_recent_trading_days(n=10, end_date=None):
-    """获取最近 n 个交易日列表
-    使用聚宽 get_trade_days 接口获取真实交易日历。
-    :param n: 需要的交易日个数
-    :param end_date: 截止日期（含），默认为当天
-    :return: 交易日字符串列表 ['2026-04-01', ...]
+def get_recent_trading_weeks(n_weeks=10, end_date=None):
+    """获取最近 n 周的交易日分组
+    每周按 ISO 周界定（周一~周日），返回每周的第一个和最后一个交易日。
+    :param n_weeks: 需要的周数（不含本周，仅取已结束的完整周）
+    :param end_date: 截止日期，默认为当天
+    :return: list of dict，每项包含 'week_label', 'first_day', 'last_day'
     """
     if end_date is None:
         end_date = dt.datetime.now().strftime('%Y-%m-%d')
-    start_date = (dt.datetime.strptime(end_date, '%Y-%m-%d') - dt.timedelta(days=30)).strftime('%Y-%m-%d')
-    days = get_trade_days(start_date=start_date, end_date=end_date)
-    days = [d.strftime('%Y-%m-%d') if hasattr(d, 'strftime') else str(d) for d in days]
-    return days[-n:]
+    # 向前多取一些天，确保覆盖 n_weeks 周
+    lookback = n_weeks * 7 + 14
+    start_date = (dt.datetime.strptime(end_date, '%Y-%m-%d') - dt.timedelta(days=lookback)).strftime('%Y-%m-%d')
+    
+    all_days = get_trade_days(start_date=start_date, end_date=end_date)
+    all_days = [d if isinstance(d, dt.date) else dt.datetime.strptime(str(d), '%Y-%m-%d').date() for d in all_days]
+    
+    # 按 ISO 周分组 (year, week_number)
+    from collections import OrderedDict
+    week_groups = OrderedDict()
+    for d in all_days:
+        iso = d.isocalendar()  # (year, week, weekday)
+        key = (iso[0], iso[1])
+        if key not in week_groups:
+            week_groups[key] = []
+        week_groups[key].append(d)
+    
+    # 判断当前日期所在的周
+    end_dt = dt.datetime.strptime(end_date, '%Y-%m-%d').date()
+    current_iso = end_dt.isocalendar()
+    current_week_key = (current_iso[0], current_iso[1])
+    
+    # 排除本周（仅取已结束的完整周），周五收盘后的数据才算完整
+    # 如果 end_date 是周六或周日，本周已结束，可以包含
+    end_weekday = end_dt.isoweekday()  # 1=Mon ... 7=Sun
+    if end_weekday <= 5:
+        # 工作日内，本周还没结束，排除本周
+        week_keys = [k for k in week_groups.keys() if k != current_week_key]
+    else:
+        # 周末，本周已结束
+        week_keys = list(week_groups.keys())
+    
+    # 取最后 n_weeks 周
+    week_keys = week_keys[-n_weeks:]
+    
+    result = []
+    for key in week_keys:
+        days = week_groups[key]
+        first_day = days[0].strftime('%Y-%m-%d')
+        last_day = days[-1].strftime('%Y-%m-%d')
+        label = '{} ~ {}'.format(first_day[5:], last_day[5:])  # '04-07 ~ 04-11'
+        result.append({
+            'week_label': label,
+            'first_day': first_day,
+            'last_day': last_day,
+        })
+    
+    return result
 
 
-def calculate_historical_scores(n_days=10, end_date=None):
-    """计算过去 n 个交易日每天的各策略评分
-    :param n_days: 回溯交易日天数
+def calculate_weekly_scores(n_weeks=10, end_date=None):
+    """计算过去 n 周每周的各策略评分
+    以每周最后一个交易日作为 calc_date 进行评分。
+    :param n_weeks: 回溯周数
     :param end_date: 截止日期，默认为当天
-    :return: pandas.DataFrame，index=日期，columns=策略名称，values=分数
+    :return: (pandas.DataFrame, week_labels)
+             DataFrame: index=last_day 日期, columns=策略名称, values=分数
+             week_labels: 与 index 对应的周标签列表 ['04-07~04-11', ...]
     """
-    trading_days = get_recent_trading_days(n=n_days, end_date=end_date)
+    weeks = get_recent_trading_weeks(n_weeks=n_weeks, end_date=end_date)
+    
+    if not weeks:
+        print("无法获取交易周数据")
+        return None, None
     
     print("\n" + "=" * 60)
-    print(f"历史评分回溯 — 计算最近 {len(trading_days)} 个交易日")
-    print(f"日期范围: {trading_days[0]} ~ {trading_days[-1]}")
+    print("历史周度评分回溯 — 计算最近 {} 周".format(len(weeks)))
+    print("日期范围: {} ~ {}".format(weeks[0]['first_day'], weeks[-1]['last_day']))
     print("=" * 60)
     
     records = []
-    for i, day in enumerate(trading_days):
-        print(f"\n[{i+1}/{len(trading_days)}] 计算 {day} 的策略评分 ...")
+    week_labels = []
+    for i, w in enumerate(weeks):
+        calc_date = w['last_day']
+        print("\n[{}/{}] 计算 {} ({}) 的策略评分 ...".format(
+            i + 1, len(weeks), w['week_label'], calc_date))
         try:
-            scorer = StrategyScorer(calc_date=day)
-            day_scores = scorer.get_all_scores()
-            row = {'日期': day}
-            for strategy_name, result in day_scores.items():
+            scorer = StrategyScorer(calc_date=calc_date)
+            week_scores = scorer.get_all_scores()
+            row = {'日期': calc_date}
+            for strategy_name, result in week_scores.items():
                 row[strategy_name] = result['score']
             records.append(row)
+            week_labels.append(w['week_label'])
         except Exception as e:
-            print(f"  计算 {day} 失败: {e}")
+            print("  计算 {} 失败: {}".format(calc_date, e))
     
     df = pd.DataFrame(records)
     if not df.empty:
         df['日期'] = pd.to_datetime(df['日期'])
         df = df.set_index('日期')
-    return df
+    return df, week_labels
 
 
-def plot_historical_scores(df_scores, save_path=None):
-    """绘制各策略评分的历史折线图
-    :param df_scores: calculate_historical_scores() 返回的 DataFrame
+def plot_weekly_scores(df_scores, week_labels, save_path=None):
+    """绘制各策略周度评分的历史折线图
+    :param df_scores: calculate_weekly_scores() 返回的 DataFrame
+    :param week_labels: 周标签列表，与 df_scores 行一一对应
     :param save_path: 图片保存路径，默认自动生成
     :return: 保存的图片路径
     """
@@ -2923,13 +2979,15 @@ def plot_historical_scores(df_scores, save_path=None):
     
     fig, ax = plt.subplots(figsize=(14, 7))
     
+    x_positions = list(range(len(df_scores)))
+    
     for col in df_scores.columns:
         color = strategy_colors.get(col, None)
-        ax.plot(df_scores.index, df_scores[col], marker='o', linewidth=2,
+        values = df_scores[col].tolist()
+        ax.plot(x_positions, values, marker='o', linewidth=2,
                 markersize=6, label=col, color=color)
-        # 在每个数据点上标注分值
-        for x, y in zip(df_scores.index, df_scores[col]):
-            ax.annotate(f'{y:.0f}', (x, y), textcoords="offset points",
+        for x, y in zip(x_positions, values):
+            ax.annotate('{:.0f}'.format(y), (x, y), textcoords="offset points",
                         xytext=(0, 8), ha='center', fontsize=8)
     
     ax.set_ylim(0, 100)
@@ -2937,57 +2995,59 @@ def plot_historical_scores(df_scores, save_path=None):
     ax.axhspan(0, 30, alpha=0.05, color='red')
     ax.axhspan(70, 100, alpha=0.05, color='green')
     
-    ax.set_xlabel('日期' if use_zh else 'Date',
-                  fontproperties=zh_font if use_zh else None, fontsize=12)
-    ax.set_ylabel('评分' if use_zh else 'Score',
-                  fontproperties=zh_font if use_zh else None, fontsize=12)
+    xlabel_text = '交易周' if use_zh else 'Week'
+    ylabel_text = '评分' if use_zh else 'Score'
+    ax.set_xlabel(xlabel_text, fontproperties=zh_font if use_zh else None, fontsize=12)
+    ax.set_ylabel(ylabel_text, fontproperties=zh_font if use_zh else None, fontsize=12)
     
-    title = '策略环境评分历史走势' if use_zh else 'Strategy Score History'
+    title = '策略环境评分周度走势' if use_zh else 'Weekly Strategy Score Trend'
     ax.set_title(title, fontproperties=zh_font if use_zh else None, fontsize=16, fontweight='bold')
     
-    # 图例
     if use_zh:
         ax.legend(prop=zh_font, loc='upper left', framealpha=0.9)
     else:
         ax.legend(loc='upper left', framealpha=0.9)
     
-    # 日期格式化
-    date_labels = [d.strftime('%m-%d') for d in df_scores.index]
-    ax.set_xticks(df_scores.index)
-    ax.set_xticklabels(date_labels, rotation=45, ha='right')
+    # X 轴标签：显示周范围
+    ax.set_xticks(x_positions)
+    if use_zh:
+        ax.set_xticklabels(week_labels, rotation=45, ha='right', fontproperties=zh_font)
+    else:
+        ax.set_xticklabels(week_labels, rotation=45, ha='right')
     
     ax.grid(True, alpha=0.3)
     fig.tight_layout()
     
     if save_path is None:
         timestamp = dt.datetime.now().strftime('%Y%m%d_%H%M%S')
-        save_path = f'strategy_scores_history_{timestamp}.png'
+        save_path = 'strategy_weekly_scores_{}.png'.format(timestamp)
     
     fig.savefig(save_path, dpi=150, bbox_inches='tight')
-    print(f"折线图已保存至: {save_path}")
+    print("折线图已保存至: {}".format(save_path))
     plt.show()
     plt.close(fig)
     return save_path
 
 
-def run_historical_analysis(n_days=10, end_date=None, save_path=None):
-    """历史评分回溯主函数 —— 计算过去 n 个交易日的评分并绘制折线图
-    :param n_days: 回溯交易日天数（默认10）
+def run_historical_analysis(n_weeks=10, end_date=None, save_path=None):
+    """历史周度评分回溯主函数 —— 计算过去 n 周的评分并绘制折线图
+    :param n_weeks: 回溯周数（默认10，仅取已结束的完整周）
     :param end_date: 截止日期，默认为当天
     :param save_path: 图片保存路径，默认自动生成
     :return: (df_scores, chart_path)
     """
-    df_scores = calculate_historical_scores(n_days=n_days, end_date=end_date)
+    df_scores, week_labels = calculate_weekly_scores(n_weeks=n_weeks, end_date=end_date)
     
     if df_scores is not None and not df_scores.empty:
-        # 打印表格
         print("\n" + "=" * 60)
-        print("历史评分汇总表")
+        print("历史周度评分汇总表")
         print("=" * 60)
-        print(df_scores.to_string())
+        # 打印时加上周标签
+        df_display = df_scores.copy()
+        df_display.insert(0, '交易周', week_labels)
+        print(df_display.to_string())
         
-        # 绘制折线图
-        chart_path = plot_historical_scores(df_scores, save_path=save_path)
+        chart_path = plot_weekly_scores(df_scores, week_labels, save_path=save_path)
         return df_scores, chart_path
     else:
         print("历史评分计算失败，无数据")
@@ -3002,5 +3062,5 @@ if __name__ == "__main__":
     # 在聚宽研究环境中直接运行
     scores, indicators, excel_path = run_strategy_monitor(output_excel=True)
     
-    # 回溯过去10个交易日评分并绘制折线图
-    df_history, chart_path = run_historical_analysis(n_days=10)
+    # 回溯过去10周的周度评分并绘制折线图
+    df_history, chart_path = run_historical_analysis(n_weeks=10)

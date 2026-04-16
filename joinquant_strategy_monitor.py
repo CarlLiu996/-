@@ -21,48 +21,146 @@ class DataFetcher:
     def __init__(self):
         pass
     
-    # 南华商品指数在聚宽上可能对应「期货品种指数」代码而非股票指数后缀；按常见写法依次尝试
+    # 南华商品指数：聚宽标的写法不统一，先静态尝试再 API 搜索名称，仍失败则用商品「8888」品种指数合成
     NANHUA_COMMODITY_INDEX_CANDIDATES = (
-        'NH8888.XSGE',   # 上期所品种指数（8888）
-        'NH0100.XSGE',   # 部分文档中的写法
+        'NH8888.XSGE',
+        'NH0100.XSGE',
         'NHCI.INDX',
         'NHCI.XSGE',
+        'NH0001.XSGE',
+    )
+    # 南华不可用时：六大商品品种指数（成交量/持仓为各品种之和，价格为等权归一后均值）
+    SYNTHETIC_COMMODITY_8888 = (
+        'RB8888.XSGE', 'CU8888.XSGE', 'AU8888.XSGE',
+        'I8888.XDCE', 'M8888.XDCE', 'SC8888.XINE',
     )
 
-    def get_nanhua_commodity_index_daily(self, period=252, end_date=None):
-        """获取南华商品指数日线（自动尝试多个标的代码，返回 (DataFrame, 实际使用的代码)）。"""
-        if end_date is None:
-            end_date = dt.datetime.now().strftime('%Y-%m-%d')
-        field_sets = [
+    @staticmethod
+    def _nanhua_price_to_frame(df, symbol):
+        if df is None or df.empty:
+            return None
+        df = df.reset_index()
+        time_col = 'index' if 'index' in df.columns else ('time' if 'time' in df.columns else df.columns[0])
+        rename_map = {
+            time_col: '日期', 'open': '开盘', 'close': '收盘',
+            'high': '最高', 'low': '最低', 'volume': '成交量',
+        }
+        if 'money' in df.columns:
+            rename_map['money'] = '成交额'
+        if 'open_interest' in df.columns:
+            rename_map['open_interest'] = '持仓量'
+        df.rename(columns=rename_map, inplace=True)
+        df['日期'] = pd.to_datetime(df['日期'])
+        return df
+
+    def _discover_nanhua_index_codes(self, end_date):
+        """从指数列表中按名称匹配「南华」「商品指数」等（聚宽各环境命名可能不同）。"""
+        codes = []
+        try:
+            try:
+                sec = get_all_securities(['index'], date=end_date)
+            except TypeError:
+                sec = get_all_securities(['index'])
+            if sec is None or sec.empty:
+                return codes
+            name_col = 'display_name' if 'display_name' in sec.columns else None
+            if name_col is None:
+                return codes
+            s = sec[name_col].astype(str)
+            mask = s.str.contains('南华', na=False) | (
+                s.str.contains('商品', na=False) & s.str.contains('期货', na=False))
+            for code in sec.index[mask].tolist():
+                if code not in codes:
+                    codes.append(code)
+        except Exception:
+            pass
+        return codes
+
+    def _try_get_price_nanhua_frame(self, symbol, period, end_date):
+        field_sets = (
             ['open', 'close', 'high', 'low', 'volume', 'money', 'open_interest'],
             ['open', 'close', 'high', 'low', 'volume', 'open_interest'],
-        ]
+        )
         last_err = None
+        for fields in field_sets:
+            try:
+                df = get_price(symbol, count=period, end_date=end_date, frequency='daily', fields=fields)
+                out = self._nanhua_price_to_frame(df, symbol)
+                if out is not None and len(out) >= 20:
+                    return out, symbol
+            except Exception as e:
+                last_err = e
+        return None, last_err
+
+    def get_nanhua_commodity_index_daily(self, period=252, end_date=None):
+        """南华商品指数日线：名称发现 → 静态候选 → 合成 8888 品种指数。返回 (DataFrame, 说明标签)。"""
+        if end_date is None:
+            end_date = dt.datetime.now().strftime('%Y-%m-%d')
+        last_err = None
+        for symbol in self._discover_nanhua_index_codes(end_date):
+            df, err = self._try_get_price_nanhua_frame(symbol, period, end_date)
+            if df is not None:
+                print(f"南华商品指数：已匹配指数列表标的 {symbol}")
+                return df, symbol
+            if err is not None:
+                last_err = err
         for symbol in self.NANHUA_COMMODITY_INDEX_CANDIDATES:
-            for fields in field_sets:
-                try:
-                    df = get_price(symbol, count=period, end_date=end_date, frequency='daily', fields=fields)
-                    if df is None or df.empty:
-                        continue
-                    df = df.reset_index()
-                    time_col = 'index' if 'index' in df.columns else ('time' if 'time' in df.columns else df.columns[0])
-                    rename_map = {
-                        time_col: '日期', 'open': '开盘', 'close': '收盘',
-                        'high': '最高', 'low': '最低', 'volume': '成交量',
-                    }
-                    if 'money' in df.columns:
-                        rename_map['money'] = '成交额'
-                    if 'open_interest' in df.columns:
-                        rename_map['open_interest'] = '持仓量'
-                    df.rename(columns=rename_map, inplace=True)
-                    df['日期'] = pd.to_datetime(df['日期'])
-                    return df, symbol
-                except Exception as e:
-                    last_err = e
-                    continue
+            df, err = self._try_get_price_nanhua_frame(symbol, period, end_date)
+            if df is not None:
+                print(f"南华商品指数：已使用静态候选 {symbol}")
+                return df, symbol
+            if err is not None:
+                last_err = err
+        synth, label = self._synthetic_commodity_board_from_8888(period, end_date)
+        if synth is not None:
+            print(f"南华商品指数：平台无官方南华代码，已用合成序列 {label}")
+            return synth, label
         if last_err is not None:
-            print(f"南华商品指数：候选代码均不可用，最后错误: {last_err}")
+            print(f"南华商品指数：均不可用，最后错误: {last_err}")
         return None, None
+
+    def _synthetic_commodity_board_from_8888(self, period, end_date):
+        """用多个商品期货「品种指数」合成近似商品板走势（非官方南华）。"""
+        need = period + 30
+        series_list = []
+        for sym in self.SYNTHETIC_COMMODITY_8888:
+            try:
+                raw = get_price(sym, count=need, end_date=end_date, frequency='daily',
+                                fields=['close', 'volume', 'open_interest'])
+                if raw is None or raw.empty:
+                    continue
+                raw = raw.reset_index()
+                tc = 'index' if 'index' in raw.columns else ('time' if 'time' in raw.columns else raw.columns[0])
+                raw['日期'] = pd.to_datetime(raw[tc])
+                raw = raw.rename(columns={'close': f'c_{sym}', 'volume': f'v_{sym}', 'open_interest': f'oi_{sym}'})
+                series_list.append(raw[['日期', f'c_{sym}', f'v_{sym}', f'oi_{sym}']])
+            except Exception:
+                continue
+        if len(series_list) < 3:
+            return None, None
+        merged = series_list[0]
+        for nxt in series_list[1:]:
+            merged = pd.merge(merged, nxt, on='日期', how='inner')
+        merged = merged.sort_values('日期')
+        if len(merged) < 20:
+            return None, None
+        close_cols = [c for c in merged.columns if c.startswith('c_')]
+        vol_cols = [c for c in merged.columns if c.startswith('v_')]
+        oi_cols = [c for c in merged.columns if c.startswith('oi_')]
+        norm = merged[close_cols].apply(lambda col: col / col.iloc[0] * 100.0)
+        merged['收盘'] = norm.mean(axis=1)
+        merged['开盘'] = merged['收盘']
+        merged['最高'] = merged['收盘']
+        merged['最低'] = merged['收盘']
+        merged['成交量'] = merged[vol_cols].sum(axis=1)
+        merged['成交额'] = 0.0
+        if oi_cols:
+            merged['持仓量'] = merged[oi_cols].sum(axis=1, skipna=True)
+        else:
+            merged['持仓量'] = np.nan
+        out = merged[['日期', '开盘', '收盘', '最高', '最低', '成交量', '成交额', '持仓量']].copy()
+        label = '合成(6品种8888):' + ','.join([s.split('.')[0] for s in self.SYNTHETIC_COMMODITY_8888])
+        return out, label
 
     def get_index_daily(self, symbol, period=120, end_date=None):
         """获取指数日线数据"""

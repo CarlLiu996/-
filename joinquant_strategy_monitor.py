@@ -27,8 +27,7 @@ class DataFetcher:
             end_date = dt.datetime.now().strftime('%Y-%m-%d')
         
         try:
-            df = get_price(symbol, count=period, end_date=end_date, frequency='daily', 
-                          fields=['open', 'close', 'high', 'low', 'volume', 'money'])
+            df = get_price(symbol, count=period, end_date=end_date, frequency='daily', fields=['open', 'close', 'high', 'low', 'volume', 'money'])
             if df is not None and not df.empty:
                 df = df.reset_index()
                 df.rename(columns={'index': '日期', 'open': '开盘', 'close': '收盘', 
@@ -46,8 +45,7 @@ class DataFetcher:
             end_date = dt.datetime.now().strftime('%Y-%m-%d')
         
         try:
-            df = get_price(symbol, count=period, end_date=end_date, frequency='daily',
-                          fields=['open', 'close', 'high', 'low', 'volume', 'money'])
+            df = get_price(symbol, count=period, end_date=end_date, frequency='daily', fields=['open', 'close', 'high', 'low', 'volume', 'money'])
             if df is not None and not df.empty:
                 df = df.reset_index()
                 df.rename(columns={'index': '日期', 'open': '开盘', 'close': '收盘',
@@ -84,12 +82,13 @@ class DataFetcher:
         try:
             dominant = get_dominant_future(underlying_symbol)
             if dominant:
-                df = get_price(dominant, count=period, end_date=dt.datetime.now().strftime('%Y-%m-%d'),
-                              frequency='daily', fields=['open', 'close', 'high', 'low', 'volume'])
+                ed = dt.datetime.now().strftime('%Y-%m-%d')
+                df = get_price(dominant, count=period, end_date=ed, frequency='daily', fields=['open', 'close', 'high', 'low', 'volume', 'money'])
                 if df is not None and not df.empty:
                     df = df.reset_index()
                     df.rename(columns={'index': '日期', 'open': '开盘价', 'close': '收盘价',
-                                      'high': '最高价', 'low': '最低价', 'volume': '成交量'}, inplace=True)
+                                      'high': '最高价', 'low': '最低价', 'volume': '成交量',
+                                      'money': '成交额'}, inplace=True)
                     df['最新价'] = df['收盘价']
                 return df
             return None
@@ -314,11 +313,7 @@ class IndicatorCalculator:
             # 获取近252+1个交易日的收盘价用于计算历史分位数
             # +1是因为计算日收益率需要前一天的数据
             history_period = 253
-            df_prices = get_price(
-                valid_stocks, count=history_period,
-                end_date=end_date, frequency='daily',
-                fields=['close'], panel=False
-            )
+            df_prices = get_price(valid_stocks, count=history_period, end_date=end_date, frequency='daily', fields=['close'], panel=False)
             
             if df_prices is None or df_prices.empty:
                 print("获取个股价格数据失败")
@@ -704,8 +699,7 @@ class IndicatorCalculator:
                         for i in code_range:
                             try:
                                 code = f'{i}.XSHG'
-                                df = get_price(code, count=3, end_date=end_date, 
-                                              frequency='daily', fields=['close', 'implied_volatility'])
+                                df = get_price(code, count=3, end_date=end_date, frequency='daily', fields=['close', 'implied_volatility'])
                                 if df is not None and not df.empty:
                                     last_iv = df['implied_volatility'].iloc[-1]
                                     if pd.notna(last_iv) and last_iv > 0:
@@ -721,9 +715,8 @@ class IndicatorCalculator:
                         best_code = option_list[len(option_list)//2][0]
                         
                         # 获取该合约的历史IV
-                        df_option = get_price(best_code, count=252, end_date=end_date,
-                                             frequency='daily', fields=['close', 'implied_volatility'])
-                        if df_option is not None and not df.empty:
+                        df_option = get_price(best_code, count=252, end_date=end_date, frequency='daily', fields=['close', 'implied_volatility'])
+                        if df_option is not None and not df_option.empty:
                             df_option = df_option.reset_index()
                             df_option.rename(columns={'index': '日期', 'implied_volatility': 'IV'}, inplace=True)
                             df_option['日期'] = pd.to_datetime(df_option['日期'])
@@ -753,8 +746,7 @@ class IndicatorCalculator:
                         for i in code_range:
                             try:
                                 code = f'{i}.XSHG'
-                                df = get_price(code, count=3, end_date=end_date,
-                                              frequency='daily', fields=['close', 'implied_volatility'])
+                                df = get_price(code, count=3, end_date=end_date, frequency='daily', fields=['close', 'implied_volatility'])
                                 if df is not None and not df.empty:
                                     last_iv = df['implied_volatility'].iloc[-1]
                                     if pd.notna(last_iv) and last_iv > 0:
@@ -768,9 +760,8 @@ class IndicatorCalculator:
                         option_list.sort(key=lambda x: x[1])
                         best_code = option_list[len(option_list)//2][0]
                         
-                        df_option = get_price(best_code, count=252, end_date=end_date,
-                                             frequency='daily', fields=['close', 'implied_volatility'])
-                        if df_option is not None and not df.empty:
+                        df_option = get_price(best_code, count=252, end_date=end_date, frequency='daily', fields=['close', 'implied_volatility'])
+                        if df_option is not None and not df_option.empty:
                             df_option = df_option.reset_index()
                             df_option.rename(columns={'index': '日期', 'implied_volatility': 'IV'}, inplace=True)
                             df_option['日期'] = pd.to_datetime(df_option['日期'])

@@ -21,6 +21,49 @@ class DataFetcher:
     def __init__(self):
         pass
     
+    # 南华商品指数在聚宽上可能对应「期货品种指数」代码而非股票指数后缀；按常见写法依次尝试
+    NANHUA_COMMODITY_INDEX_CANDIDATES = (
+        'NH8888.XSGE',   # 上期所品种指数（8888）
+        'NH0100.XSGE',   # 部分文档中的写法
+        'NHCI.INDX',
+        'NHCI.XSGE',
+    )
+
+    def get_nanhua_commodity_index_daily(self, period=252, end_date=None):
+        """获取南华商品指数日线（自动尝试多个标的代码，返回 (DataFrame, 实际使用的代码)）。"""
+        if end_date is None:
+            end_date = dt.datetime.now().strftime('%Y-%m-%d')
+        field_sets = [
+            ['open', 'close', 'high', 'low', 'volume', 'money', 'open_interest'],
+            ['open', 'close', 'high', 'low', 'volume', 'open_interest'],
+        ]
+        last_err = None
+        for symbol in self.NANHUA_COMMODITY_INDEX_CANDIDATES:
+            for fields in field_sets:
+                try:
+                    df = get_price(symbol, count=period, end_date=end_date, frequency='daily', fields=fields)
+                    if df is None or df.empty:
+                        continue
+                    df = df.reset_index()
+                    time_col = 'index' if 'index' in df.columns else ('time' if 'time' in df.columns else df.columns[0])
+                    rename_map = {
+                        time_col: '日期', 'open': '开盘', 'close': '收盘',
+                        'high': '最高', 'low': '最低', 'volume': '成交量',
+                    }
+                    if 'money' in df.columns:
+                        rename_map['money'] = '成交额'
+                    if 'open_interest' in df.columns:
+                        rename_map['open_interest'] = '持仓量'
+                    df.rename(columns=rename_map, inplace=True)
+                    df['日期'] = pd.to_datetime(df['日期'])
+                    return df, symbol
+                except Exception as e:
+                    last_err = e
+                    continue
+        if last_err is not None:
+            print(f"南华商品指数：候选代码均不可用，最后错误: {last_err}")
+        return None, None
+
     def get_index_daily(self, symbol, period=120, end_date=None):
         """获取指数日线数据"""
         if end_date is None:
@@ -471,12 +514,12 @@ class IndicatorCalculator:
     def get_cta_indicators(self):
         """CTA策略指标：南华商品指数 20 日年化波动率、20 日均量、持仓量（open_interest）及各自历史分位数。"""
         indicators = {}
-        nhci_code = 'NH0100.XSGE'
         try:
-            df = self.fetcher.get_index_daily(nhci_code, period=252)
+            df, nhci_code = self.fetcher.get_nanhua_commodity_index_daily(period=252)
             if df is None or df.empty or len(df) < 20:
-                print("南华商品指数数据不足，跳过CTA指标")
+                print("南华商品指数数据不足，跳过CTA指标（可检查聚宽是否提供该指数/品种指数代码）")
                 return indicators
+            indicators['nhci_data_symbol'] = nhci_code
             df = df.sort_values('日期')
             df['daily_return'] = df['收盘'].pct_change()
             df['volatility_20d'] = df['daily_return'].rolling(20).std() * np.sqrt(252) * 100
@@ -503,10 +546,7 @@ class IndicatorCalculator:
             else:
                 try:
                     end_d = df['日期'].iloc[-1]
-                    if hasattr(end_d, 'strftime'):
-                        end_s = end_d.strftime('%Y-%m-%d')
-                    else:
-                        end_s = str(end_d)[:10]
+                    end_s = end_d.strftime('%Y-%m-%d') if hasattr(end_d, 'strftime') else str(end_d)[:10]
                     oi_raw = get_price(nhci_code, count=252, end_date=end_s, frequency='daily', fields=['open_interest'])
                     if oi_raw is not None and not oi_raw.empty:
                         oi_raw = oi_raw.reset_index()
@@ -1754,7 +1794,8 @@ class ExcelReportGenerator:
         """CTA策略指标sheet - 南华商品指数（波动率、均量、持仓）"""
         ws = wb.create_sheet("CTA策略指标")
         
-        ws['A1'] = 'CTA策略 - 南华商品指数（NH0100.XSGE）'
+        sym = indicators.get('nhci_data_symbol', '南华商品指数')
+        ws['A1'] = f'CTA策略 - 南华商品指数（数据源: {sym}）'
         ws['A1'].font = Font(bold=True, size=14, color='1F4E78')
         ws.merge_cells('A1:E1')
         ws['A1'].alignment = Alignment(horizontal='center', vertical='center')
@@ -2258,6 +2299,9 @@ def collect_all_indicators():
     print("\n[3/7] 收集CTA策略指标（南华商品指数）...")
     cta = calculator.get_cta_indicators()
     all_indicators['cta'] = cta
+    sym = cta.get('nhci_data_symbol')
+    if sym:
+        print(f"  - 南华指数数据源: {sym}")
     print(f"  - 南华CTA相关指标键: {len(cta)}个")
     
     # 4. ETF / 套利相关指标

@@ -21,145 +21,112 @@ class DataFetcher:
     def __init__(self):
         pass
     
-    # 南华商品指数：聚宽标的写法不统一，先静态尝试再 API 搜索名称，仍失败则用商品「8888」品种指数合成
-    NANHUA_COMMODITY_INDEX_CANDIDATES = (
-        'NH8888.XSGE',
-        'NH0100.XSGE',
-        'NHCI.INDX',
-        'NHCI.XSGE',
-        'NH0001.XSGE',
-    )
-    # 南华不可用时：六大商品品种指数（成交量/持仓为各品种之和，价格为等权归一后均值）
-    SYNTHETIC_COMMODITY_8888 = (
-        'RB8888.XSGE', 'CU8888.XSGE', 'AU8888.XSGE',
-        'I8888.XDCE', 'M8888.XDCE', 'SC8888.XINE',
-    )
+    # CTA 商品板：遍历期货列表取品种代码，主力合约日线等权合成（排除金融期货 CCFX）
+    # 全品种遍历可能较慢；需要全覆盖可调大（建议研究环境 ≤500）
+    MAX_COMMODITY_UNDERLYINGS = 400
 
     @staticmethod
-    def _nanhua_price_to_frame(df, symbol):
-        if df is None or df.empty:
-            return None
-        df = df.reset_index()
-        time_col = 'index' if 'index' in df.columns else ('time' if 'time' in df.columns else df.columns[0])
-        rename_map = {
-            time_col: '日期', 'open': '开盘', 'close': '收盘',
-            'high': '最高', 'low': '最低', 'volume': '成交量',
-        }
-        if 'money' in df.columns:
-            rename_map['money'] = '成交额'
-        if 'open_interest' in df.columns:
-            rename_map['open_interest'] = '持仓量'
-        df.rename(columns=rename_map, inplace=True)
-        df['日期'] = pd.to_datetime(df['日期'])
-        return df
+    def _future_underlying_alpha(contract_code):
+        """从合约代码提取品种字母，如 ag2505.XDCE -> AG"""
+        base = contract_code.split('.')[0]
+        return ''.join(c for c in base if c.isalpha()).upper()
 
-    def _discover_nanhua_index_codes(self, end_date):
-        """从指数列表中按名称匹配「南华」「商品指数」等（聚宽各环境命名可能不同）。"""
-        codes = []
-        try:
-            try:
-                sec = get_all_securities(['index'], date=end_date)
-            except TypeError:
-                sec = get_all_securities(['index'])
-            if sec is None or sec.empty:
-                return codes
-            name_col = 'display_name' if 'display_name' in sec.columns else None
-            if name_col is None:
-                return codes
-            s = sec[name_col].astype(str)
-            mask = s.str.contains('南华', na=False) | (
-                s.str.contains('商品', na=False) & s.str.contains('期货', na=False))
-            for code in sec.index[mask].tolist():
-                if code not in codes:
-                    codes.append(code)
-        except Exception:
-            pass
-        return codes
-
-    def _try_get_price_nanhua_frame(self, symbol, period, end_date):
-        field_sets = (
-            ['open', 'close', 'high', 'low', 'volume', 'money', 'open_interest'],
-            ['open', 'close', 'high', 'low', 'volume', 'open_interest'],
-        )
-        last_err = None
-        for fields in field_sets:
-            try:
-                df = get_price(symbol, count=period, end_date=end_date, frequency='daily', fields=fields)
-                out = self._nanhua_price_to_frame(df, symbol)
-                if out is not None and len(out) >= 20:
-                    return out, symbol
-            except Exception as e:
-                last_err = e
-        return None, last_err
-
-    def get_nanhua_commodity_index_daily(self, period=252, end_date=None):
-        """南华商品指数日线：名称发现 → 静态候选 → 合成 8888 品种指数。返回 (DataFrame, 说明标签)。"""
+    def get_commodity_equal_weight_main_daily(self, period=252, end_date=None):
+        """全商品期货（排除 CCFX）各品种主力合约日线，收盘价各自首日归一后等权均值；成交量、持仓为各品种加总。"""
         if end_date is None:
             end_date = dt.datetime.now().strftime('%Y-%m-%d')
-        last_err = None
-        for symbol in self._discover_nanhua_index_codes(end_date):
-            df, err = self._try_get_price_nanhua_frame(symbol, period, end_date)
-            if df is not None:
-                print(f"南华商品指数：已匹配指数列表标的 {symbol}")
-                return df, symbol
-            if err is not None:
-                last_err = err
-        for symbol in self.NANHUA_COMMODITY_INDEX_CANDIDATES:
-            df, err = self._try_get_price_nanhua_frame(symbol, period, end_date)
-            if df is not None:
-                print(f"南华商品指数：已使用静态候选 {symbol}")
-                return df, symbol
-            if err is not None:
-                last_err = err
-        synth, label = self._synthetic_commodity_board_from_8888(period, end_date)
-        if synth is not None:
-            print(f"南华商品指数：平台无官方南华代码，已用合成序列 {label}")
-            return synth, label
-        if last_err is not None:
-            print(f"南华商品指数：均不可用，最后错误: {last_err}")
-        return None, None
-
-    def _synthetic_commodity_board_from_8888(self, period, end_date):
-        """用多个商品期货「品种指数」合成近似商品板走势（非官方南华）。"""
-        need = period + 30
-        series_list = []
-        for sym in self.SYNTHETIC_COMMODITY_8888:
+        try:
             try:
-                raw = get_price(sym, count=need, end_date=end_date, frequency='daily',
-                                fields=['close', 'volume', 'open_interest'])
-                if raw is None or raw.empty:
+                all_f = get_all_securities(['futures'], date=end_date)
+            except TypeError:
+                all_f = get_all_securities(['futures'])
+        except Exception as e:
+            print(f"获取期货列表失败: {e}")
+            return None, None
+        if all_f is None or all_f.empty:
+            return None, None
+
+        seen = set()
+        underlyings = []
+        for contract in all_f.index:
+            u = self._future_underlying_alpha(contract)
+            if not u or u in seen:
+                continue
+            seen.add(u)
+            underlyings.append(u)
+        underlyings.sort()
+        if len(underlyings) > self.MAX_COMMODITY_UNDERLYINGS:
+            print(f"CTA合成：品种数 {len(underlyings)}，仅处理前 {self.MAX_COMMODITY_UNDERLYINGS} 个（按字母序）")
+            underlyings = underlyings[: self.MAX_COMMODITY_UNDERLYINGS]
+
+        need = min(period + 60, 400)
+        closes = {}
+        volumes = {}
+        ois = {}
+        for u in underlyings:
+            try:
+                try:
+                    main = get_dominant_future(u, end_date)
+                except TypeError:
+                    main = get_dominant_future(u)
+                if not main or '.CCFX' in str(main).upper():
                     continue
-                raw = raw.reset_index()
-                tc = 'index' if 'index' in raw.columns else ('time' if 'time' in raw.columns else raw.columns[0])
-                raw['日期'] = pd.to_datetime(raw[tc])
-                raw = raw.rename(columns={'close': f'c_{sym}', 'volume': f'v_{sym}', 'open_interest': f'oi_{sym}'})
-                series_list.append(raw[['日期', f'c_{sym}', f'v_{sym}', f'oi_{sym}']])
+                try:
+                    df = get_price(main, end_date=end_date, frequency='daily', count=need,
+                                    fields=['close', 'volume', 'open_interest'], skip_paused=True)
+                except TypeError:
+                    df = get_price(main, end_date=end_date, frequency='daily', count=need,
+                                    fields=['close', 'volume', 'open_interest'])
+                if df is None or df.empty or len(df) < 20:
+                    continue
+                idx = pd.to_datetime(df.index)
+                closes[u] = pd.Series(df['close'].values, index=idx, dtype=float)
+                volumes[u] = pd.Series(df['volume'].values, index=idx, dtype=float)
+                if 'open_interest' in df.columns:
+                    ois[u] = pd.Series(df['open_interest'].values, index=idx, dtype=float)
             except Exception:
                 continue
-        if len(series_list) < 3:
+
+        if len(closes) < 5:
+            print(f"CTA合成：有效主力品种仅 {len(closes)} 个，不足 5 个")
             return None, None
-        merged = series_list[0]
-        for nxt in series_list[1:]:
-            merged = pd.merge(merged, nxt, on='日期', how='inner')
-        merged = merged.sort_values('日期')
-        if len(merged) < 20:
-            return None, None
-        close_cols = [c for c in merged.columns if c.startswith('c_')]
-        vol_cols = [c for c in merged.columns if c.startswith('v_')]
-        oi_cols = [c for c in merged.columns if c.startswith('oi_')]
-        norm = merged[close_cols].apply(lambda col: col / col.iloc[0] * 100.0)
-        merged['收盘'] = norm.mean(axis=1)
-        merged['开盘'] = merged['收盘']
-        merged['最高'] = merged['收盘']
-        merged['最低'] = merged['收盘']
-        merged['成交量'] = merged[vol_cols].sum(axis=1)
-        merged['成交额'] = 0.0
-        if oi_cols:
-            merged['持仓量'] = merged[oi_cols].sum(axis=1, skipna=True)
+
+        panel_c = pd.DataFrame(closes).sort_index()
+        panel_c = panel_c.ffill()
+        panel_c = panel_c.iloc[max(0, len(panel_c) - need - 20):]
+        for col in panel_c.columns:
+            s = panel_c[col].dropna()
+            if len(s) == 0:
+                continue
+            first = float(s.iloc[0])
+            if first > 0:
+                panel_c[col] = panel_c[col] / first * 100.0
+        eq_close = panel_c.mean(axis=1, skipna=True)
+
+        panel_v = pd.DataFrame(volumes).reindex(panel_c.index).fillna(0)
+        sum_vol = panel_v.sum(axis=1, skipna=True)
+
+        if ois:
+            panel_oi = pd.DataFrame(ois).reindex(panel_c.index)
+            sum_oi = panel_oi.sum(axis=1, skipna=True)
         else:
-            merged['持仓量'] = np.nan
-        out = merged[['日期', '开盘', '收盘', '最高', '最低', '成交量', '成交额', '持仓量']].copy()
-        label = '合成(6品种8888):' + ','.join([s.split('.')[0] for s in self.SYNTHETIC_COMMODITY_8888])
+            sum_oi = pd.Series(np.nan, index=panel_c.index)
+
+        out = pd.DataFrame({
+            '日期': panel_c.index,
+            '收盘': eq_close.values,
+            '开盘': eq_close.values,
+            '最高': eq_close.values,
+            '最低': eq_close.values,
+            '成交量': sum_vol.values,
+            '成交额': 0.0,
+            '持仓量': sum_oi.values,
+        })
+        out = out.reset_index(drop=True)
+        out['日期'] = pd.to_datetime(out['日期'])
+        nvar = len(closes)
+        label = f'商品主力等权合成({nvar}品种)'
+        print(f"CTA：已构建 {label}")
         return out, label
 
     def get_index_daily(self, symbol, period=120, end_date=None):
@@ -607,17 +574,17 @@ class IndicatorCalculator:
         
         return indicators
     
-    # ==================== CTA策略指标（南华商品指数） ====================
+    # ==================== CTA策略指标（商品期货主力等权合成） ====================
     
     def get_cta_indicators(self):
-        """CTA策略指标：南华商品指数 20 日年化波动率、20 日均量、持仓量（open_interest）及各自历史分位数。"""
+        """CTA：全商品主力合约等权合成序列的 20 日年化波动率、20 日均量、总持仓及历史分位数。"""
         indicators = {}
         try:
-            df, nhci_code = self.fetcher.get_nanhua_commodity_index_daily(period=252)
+            df, cta_label = self.fetcher.get_commodity_equal_weight_main_daily(period=252)
             if df is None or df.empty or len(df) < 20:
-                print("南华商品指数数据不足，跳过CTA指标（可检查聚宽是否提供该指数/品种指数代码）")
+                print("CTA：商品主力等权合成数据不足，跳过CTA指标")
                 return indicators
-            indicators['nhci_data_symbol'] = nhci_code
+            indicators['nhci_data_symbol'] = cta_label
             df = df.sort_values('日期')
             df['daily_return'] = df['收盘'].pct_change()
             df['volatility_20d'] = df['daily_return'].rolling(20).std() * np.sqrt(252) * 100
@@ -636,24 +603,7 @@ class IndicatorCalculator:
             if ap is not None:
                 indicators['nhci_volume_percentile'] = ap
                 indicators['nhci_volume_percentile_days'] = ad
-            oi_series = None
-            if '持仓量' in df.columns:
-                oi_series = df['持仓量']
-            elif 'open_interest' in df.columns:
-                oi_series = df['open_interest']
-            else:
-                try:
-                    end_d = df['日期'].iloc[-1]
-                    end_s = end_d.strftime('%Y-%m-%d') if hasattr(end_d, 'strftime') else str(end_d)[:10]
-                    oi_raw = get_price(nhci_code, count=252, end_date=end_s, frequency='daily', fields=['open_interest'])
-                    if oi_raw is not None and not oi_raw.empty:
-                        oi_raw = oi_raw.reset_index()
-                        time_col = 'index' if 'index' in oi_raw.columns else ('time' if 'time' in oi_raw.columns else oi_raw.columns[0])
-                        oi_raw['日期'] = pd.to_datetime(oi_raw[time_col])
-                        df = pd.merge(df, oi_raw[['日期', 'open_interest']], on='日期', how='left')
-                        oi_series = df['open_interest']
-                except Exception:
-                    pass
+            oi_series = df['持仓量'] if '持仓量' in df.columns else None
             if oi_series is not None and oi_series.notna().any():
                 cur_oi = oi_series.iloc[-1]
                 if pd.notna(cur_oi):
@@ -663,7 +613,7 @@ class IndicatorCalculator:
                     indicators['nhci_open_interest_percentile'] = op
                     indicators['nhci_open_interest_percentile_days'] = od
         except Exception as e:
-            print(f"计算南华商品指数CTA指标失败: {e}")
+            print(f"计算CTA商品合成指标失败: {e}")
         return indicators
     
     # ==================== 套利策略指标 ====================
@@ -1130,7 +1080,7 @@ class StrategyScorer:
         }
     
     def score_cta(self):
-        """CTA策略评分 - 南华商品指数：波动率、成交量、持仓量分位数综合"""
+        """CTA策略评分 - 商品主力等权合成：波动率、成交量、持仓分位数"""
         score = 50
         details = []
         
@@ -1143,15 +1093,15 @@ class StrategyScorer:
             if vol_pct is not None:
                 if vol_pct > 70:
                     score += 22
-                    details.append(f"南华20日年化波动率分位高({vol_val:.1f}%, 分位{vol_pct:.0f}%, {vol_days}天): +22")
+                    details.append(f"商品合成波动率分位高({vol_val:.1f}%, 分位{vol_pct:.0f}%, {vol_days}天): +22")
                 elif vol_pct > 30:
                     score += 10
-                    details.append(f"南华波动率分位适中({vol_val:.1f}%, 分位{vol_pct:.0f}%, {vol_days}天): +10")
+                    details.append(f"商品合成波动率分位适中({vol_val:.1f}%, 分位{vol_pct:.0f}%, {vol_days}天): +10")
                 else:
                     score -= 10
-                    details.append(f"南华波动率分位低({vol_val:.1f}%, 分位{vol_pct:.0f}%, {vol_days}天): -10")
+                    details.append(f"商品合成波动率分位低({vol_val:.1f}%, 分位{vol_pct:.0f}%, {vol_days}天): -10")
             else:
-                details.append("南华波动率分位数据不足: 0")
+                details.append("商品合成波动率分位数据不足: 0")
             
             amt_pct = cta_indicators.get('nhci_volume_percentile')
             amt_days = cta_indicators.get('nhci_volume_percentile_days', 0)
@@ -1159,15 +1109,15 @@ class StrategyScorer:
             if amt_pct is not None:
                 if amt_pct > 70:
                     score += 18
-                    details.append(f"南华20日均量分位高({amt_val:,.0f}, 分位{amt_pct:.0f}%, {amt_days}天): +18")
+                    details.append(f"商品合成20日均量分位高({amt_val:,.0f}, 分位{amt_pct:.0f}%, {amt_days}天): +18")
                 elif amt_pct > 30:
                     score += 8
-                    details.append(f"南华均量分位适中({amt_val:,.0f}, 分位{amt_pct:.0f}%, {amt_days}天): +8")
+                    details.append(f"商品合成均量分位适中({amt_val:,.0f}, 分位{amt_pct:.0f}%, {amt_days}天): +8")
                 else:
                     score -= 8
-                    details.append(f"南华均量分位低({amt_val:,.0f}, 分位{amt_pct:.0f}%, {amt_days}天): -8")
+                    details.append(f"商品合成均量分位低({amt_val:,.0f}, 分位{amt_pct:.0f}%, {amt_days}天): -8")
             else:
-                details.append("南华成交量分位数据不足: 0")
+                details.append("商品合成成交量分位数据不足: 0")
             
             oi_pct = cta_indicators.get('nhci_open_interest_percentile')
             oi_days = cta_indicators.get('nhci_open_interest_percentile_days', 0)
@@ -1175,15 +1125,15 @@ class StrategyScorer:
             if oi_pct is not None:
                 if oi_pct > 70:
                     score += 15
-                    details.append(f"南华持仓分位高({oi_val:,.0f}, 分位{oi_pct:.0f}%, {oi_days}天): +15")
+                    details.append(f"商品合成持仓分位高({oi_val:,.0f}, 分位{oi_pct:.0f}%, {oi_days}天): +15")
                 elif oi_pct > 30:
                     score += 7
-                    details.append(f"南华持仓分位适中({oi_val:,.0f}, 分位{oi_pct:.0f}%, {oi_days}天): +7")
+                    details.append(f"商品合成持仓分位适中({oi_val:,.0f}, 分位{oi_pct:.0f}%, {oi_days}天): +7")
                 else:
                     score -= 7
-                    details.append(f"南华持仓分位低({oi_val:,.0f}, 分位{oi_pct:.0f}%, {oi_days}天): -7")
+                    details.append(f"商品合成持仓分位低({oi_val:,.0f}, 分位{oi_pct:.0f}%, {oi_days}天): -7")
             else:
-                details.append("南华持仓量分位数据不足: 0")
+                details.append("商品合成持仓量分位数据不足: 0")
             
         except Exception as e:
             details.append(f"评分计算出错: {e}")
@@ -1889,11 +1839,11 @@ class ExcelReportGenerator:
         ws.column_dimensions['D'].width = 60
     
     def _create_cta_sheet(self, wb, indicators):
-        """CTA策略指标sheet - 南华商品指数（波动率、均量、持仓）"""
+        """CTA策略指标sheet - 商品主力等权合成（波动率、均量、总持仓）"""
         ws = wb.create_sheet("CTA策略指标")
         
-        sym = indicators.get('nhci_data_symbol', '南华商品指数')
-        ws['A1'] = f'CTA策略 - 南华商品指数（数据源: {sym}）'
+        sym = indicators.get('nhci_data_symbol', '商品主力等权合成')
+        ws['A1'] = f'CTA策略 - {sym}'
         ws['A1'].font = Font(bold=True, size=14, color='1F4E78')
         ws.merge_cells('A1:E1')
         ws['A1'].alignment = Alignment(horizontal='center', vertical='center')
@@ -1933,17 +1883,17 @@ class ExcelReportGenerator:
         vol = indicators.get('nhci_volatility_20d')
         vol_pct = indicators.get('nhci_volatility_percentile')
         vol_days = indicators.get('nhci_volatility_percentile_days', 0)
-        write_row('南华商品指数', '20日年化波动率', f"{vol}%" if vol is not None else None, vol_pct, vol_days, '%')
+        write_row('商品合成', '20日年化波动率', f"{vol}%" if vol is not None else None, vol_pct, vol_days, '%')
         
         av = indicators.get('nhci_avg_volume_20d')
         av_pct = indicators.get('nhci_volume_percentile')
         av_days = indicators.get('nhci_volume_percentile_days', 0)
-        write_row('南华商品指数', '20日平均成交量', f"{av:,.0f}" if av is not None else None, av_pct, av_days, '手')
+        write_row('商品合成', '20日平均成交量', f"{av:,.0f}" if av is not None else None, av_pct, av_days, '手')
         
         oi = indicators.get('nhci_open_interest')
         oi_pct = indicators.get('nhci_open_interest_percentile')
         oi_days = indicators.get('nhci_open_interest_percentile_days', 0)
-        write_row('南华商品指数', '持仓量', f"{oi:,.0f}" if oi is not None else None, oi_pct, oi_days, '手')
+        write_row('商品合成', '总持仓量', f"{oi:,.0f}" if oi is not None else None, oi_pct, oi_days, '手')
         
         ws.column_dimensions['A'].width = 16
         ws.column_dimensions['B'].width = 22
@@ -2393,14 +2343,14 @@ def collect_all_indicators():
     if yijiu_idx is not None:
         print(f"  - 一九行情指数: {yijiu_idx}分 ({yijiu_lvl})")
     
-    # 3. CTA指标（南华商品指数）
-    print("\n[3/7] 收集CTA策略指标（南华商品指数）...")
+    # 3. CTA指标（商品主力等权合成）
+    print("\n[3/7] 收集CTA策略指标（商品主力等权合成）...")
     cta = calculator.get_cta_indicators()
     all_indicators['cta'] = cta
     sym = cta.get('nhci_data_symbol')
     if sym:
-        print(f"  - 南华指数数据源: {sym}")
-    print(f"  - 南华CTA相关指标键: {len(cta)}个")
+        print(f"  - CTA数据源说明: {sym}")
+    print(f"  - CTA相关指标键: {len(cta)}个")
     
     # 4. ETF / 套利相关指标
     print("\n[4/7] 收集ETF与套利指标...")

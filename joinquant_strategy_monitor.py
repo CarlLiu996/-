@@ -11,24 +11,6 @@ from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 # 聚宽数据API导入
 from jqdata import *
 
-# 评分用阈值与加减分：不在代码里写死数值，避免用不准确的常数代替真实数据。
-# 需要打分时在此字典中填写，例如：
-# SCORE_WEIGHTS = {
-#     'subjective': {
-#         'market_amount_high': (10000, 12),   # (阈值亿元, 加分)
-#         'market_amount_low': (6000, -12),
-#         'pe_pct_cheap': (30, 18), 'pe_pct_expensive': (70, -18),
-#         'gv_ratio_high': (2, 10), 'gv_ratio_low': (-2, -10),
-#         'amount_change_high': (10, 8), 'amount_change_low': (-10, -8),
-#     },
-#     'quant': {
-#         'market_amount_high': (10000, 10), 'market_amount_low': (6000, -10),
-#         'crowding_high': (20, -15), 'crowding_low': (10, 15),
-#     },
-# }
-# 各策略评分函数在 SCORE_WEIGHTS 为空时一律保持 50 分并列明原因，避免用硬编码常数冒充数据。
-SCORE_WEIGHTS = {}
-
 # ============================================
 # 数据获取模块 - 使用聚宽API
 # ============================================
@@ -379,7 +361,7 @@ class IndicatorCalculator:
                     indicators['market_divergence_percentile'] = percentile
                     indicators['market_divergence_percentile_days'] = days
             
-            # 不再内置「一九指数」主观阈值打分；仅输出分化度序列，供自行配置 SCORE_WEIGHTS 后评分
+            # 不再内置「一九指数」主观阈值打分；仅输出分化度序列，评分侧用其历史分位
             
         except Exception as e:
             print(f"计算一九行情指标失败: {e}")
@@ -932,66 +914,282 @@ class IndicatorCalculator:
 # ============================================
 
 class StrategyScorer:
-    """策略评分类：不在代码中写死阈值与加减分；请配置全局 SCORE_WEIGHTS 后扩展 _score_from_weights。"""
+    """策略评分：以各指标在自身历史分布中的分位数为主，线性映射到加减分（不依赖 SCORE_WEIGHTS 占位）。"""
     
     def __init__(self):
         self.calculator = IndicatorCalculator()
 
+    @staticmethod
+    def _clamp_score(s):
+        return max(0, min(100, int(round(s))))
+
+    def _pct_contrib(self, pct, days, label, weight, details):
+        """分位数 P∈[0,100] 相对中位 50 线性贡献，权重为极端满分幅度。"""
+        if pct is None:
+            details.append(f"{label}: 历史分位数据不足")
+            return 0.0
+        c = (float(pct) - 50.0) / 50.0 * float(weight)
+        dstr = f"{days}天" if days else ""
+        details.append(f"{label} 历史分位{pct:.1f}% ({dstr}): {c:+.1f}")
+        return c
+
+    def _series_market_amount_20d_avg(self, count=300):
+        df = self.calculator.fetcher.get_index_daily("000001.XSHG", period=count)
+        if df is None or df.empty or len(df) < 40:
+            return None
+        df = df.sort_values('日期')
+        return (df['成交额'].rolling(20).mean() / 1e8).dropna()
+
+    def _series_amount_change_20d(self, count=300):
+        df = self.calculator.fetcher.get_index_daily("000001.XSHG", period=count)
+        if df is None or df.empty or len(df) < 40:
+            return None
+        df = df.sort_values('日期')
+        a = df['成交额']
+        return ((a / a.shift(20) - 1.0) * 100.0).dropna()
+
+    def _series_growth_value_ratio(self, count=120):
+        df_cy = self.calculator.fetcher.get_index_daily("399006.XSHE", period=count)
+        df_hs = self.calculator.fetcher.get_index_daily("000300.XSHG", period=count)
+        if df_cy is None or df_hs is None or df_cy.empty or df_hs.empty:
+            return None
+        df_cy = df_cy.sort_values('日期').set_index('日期')['收盘']
+        df_hs = df_hs.sort_values('日期').set_index('日期')['收盘']
+        m = pd.concat([df_cy, df_hs], axis=1, join='inner').dropna()
+        if len(m) < 25:
+            return None
+        r_cy = m.iloc[:, 0].pct_change(20) * 100.0
+        r_hs = m.iloc[:, 1].pct_change(20) * 100.0
+        return (r_cy - r_hs).dropna()
+
+    def _series_crowding(self, index_code, count=300):
+        df_all = self.calculator.fetcher.get_index_daily("000985.XSHG", period=count)
+        df_idx = self.calculator.fetcher.get_index_daily(index_code, period=count)
+        if df_all is None or df_idx is None or df_all.empty or df_idx.empty:
+            return None
+        df_all = df_all.sort_values('日期').set_index('日期')['成交额']
+        df_idx = df_idx.sort_values('日期').set_index('日期')['成交额']
+        m = pd.concat([df_all, df_idx], axis=1, join='inner').dropna()
+        if len(m) < 25:
+            return None
+        roll_a = m.iloc[:, 0].rolling(20).sum()
+        roll_i = m.iloc[:, 1].rolling(20).sum()
+        return (roll_i / roll_a * 100.0).dropna()
+
+    def _contrib_from_series(self, series, label, weight, details):
+        if series is None or len(series) < 20:
+            details.append(f"{label}: 序列数据不足")
+            return 0.0
+        pct, days = self.calculator.calculate_percentile_with_days(series, window=252, min_days=20)
+        return self._pct_contrib(pct, days, label, weight, details)
+
     def score_subjective_long(self):
-        score, details = 50, []
-        if SCORE_WEIGHTS.get('subjective'):
-            details.append("已配置 subjective 权重但未实现自动解析，请自行实现或保持中性 50 分")
-        else:
-            details.append("未配置 SCORE_WEIGHTS['subjective']：不代入默认成交额/PE 等占位，评分保持 50")
-        return {'score': score, 'details': details, 'level': self._get_level(score), 'trend': '→ 持平'}
+        score, details = 50.0, []
+        try:
+            val = self.calculator.get_sentiment_indicators()
+            valn = self.calculator.get_valuation_indicators()
+            pe_pct = valn.get('沪深300_PE_percentile')
+            pe_days = valn.get('沪深300_PE_percentile_days', 0)
+            score += self._pct_contrib(pe_pct, pe_days, '沪深300估值(价格逆代理分位)', 22, details)
+            score += self._contrib_from_series(self._series_market_amount_20d_avg(), '上证20日均成交额(亿元)', 16, details)
+            score += self._contrib_from_series(self._series_amount_change_20d(), '上证成交额20日环比(%)', 12, details)
+            score += self._contrib_from_series(self._series_growth_value_ratio(), '创业板相对沪深300(20日超额%)', 12, details)
+        except Exception as e:
+            details.append(f"评分计算出错: {e}")
+        return {'score': self._clamp_score(score), 'details': details, 'level': self._get_level(score), 'trend': '→ 持平'}
 
     def score_quant_long(self):
-        score, details = 50, []
-        if SCORE_WEIGHTS.get('quant'):
-            details.append("已配置 quant 权重但未实现自动解析，请自行实现或保持中性 50 分")
-        else:
-            details.append("未配置 SCORE_WEIGHTS['quant']：不使用拥挤度/一九指数等硬编码阈值，评分保持 50")
-        return {'score': score, 'details': details, 'level': self._get_level(score), 'trend': '→ 持平'}
+        score, details = 50.0, []
+        try:
+            q = self.calculator.get_quant_indicators()
+            score += self._contrib_from_series(self._series_market_amount_20d_avg(), '市场20日均成交额(亿元)', 12, details)
+            score += self._contrib_from_series(self._series_crowding('000852.XSHG'), '中证1000拥挤度(占全市场%)', 18, details)
+            div_pct = q.get('market_divergence_percentile')
+            div_days = q.get('market_divergence_percentile_days', 0)
+            score += self._pct_contrib(div_pct, div_days, '市值加权-等权分化度(20日累计)历史分位', 22, details)
+        except Exception as e:
+            details.append(f"评分计算出错: {e}")
+        return {'score': self._clamp_score(score), 'details': details, 'level': self._get_level(score), 'trend': '→ 持平'}
 
     def score_cta(self):
-        score, details = 50, []
-        if SCORE_WEIGHTS.get('cta'):
-            details.append("已配置 cta 权重但未实现自动解析，请自行实现或保持中性 50 分")
-        else:
-            details.append("未配置 SCORE_WEIGHTS['cta']：不使用分位数硬编码阈值，评分保持 50")
-        return {'score': score, 'details': details, 'level': self._get_level(score), 'trend': '→ 持平'}
+        score, details = 50.0, []
+        try:
+            c = self.calculator.get_cta_indicators()
+            vol_pcts, vol_days = [], []
+            amt_pcts, amt_days = [], []
+            pos_pcts, pos_days = [], []
+            for sym in ['RB', 'CU', 'SC', 'M', 'I', 'AU']:
+                p = c.get(f'{sym}_volatility_percentile')
+                if p is not None:
+                    vol_pcts.append(p)
+                    vol_days.append(c.get(f'{sym}_volatility_percentile_days', 0))
+                p = c.get(f'{sym}_volume_percentile')
+                if p is not None:
+                    amt_pcts.append(p)
+                    amt_days.append(c.get(f'{sym}_volume_percentile_days', 0))
+                p = c.get(f'{sym}_positions_percentile')
+                if p is not None:
+                    pos_pcts.append(p)
+                    pos_days.append(c.get(f'{sym}_positions_percentile_days', 0))
+            if vol_pcts:
+                mp, md = float(np.mean(vol_pcts)), int(np.mean(vol_days)) if vol_days else 0
+                score += self._pct_contrib(mp, md, '商品波动率分位(多品种均值)', 20, details)
+            else:
+                details.append('商品波动率分位: 数据不足')
+            if amt_pcts:
+                mp, md = float(np.mean(amt_pcts)), int(np.mean(amt_days)) if amt_days else 0
+                score += self._pct_contrib(mp, md, '商品成交量分位(多品种均值)', 16, details)
+            else:
+                details.append('商品成交量分位: 数据不足')
+            if pos_pcts:
+                mp, md = float(np.mean(pos_pcts)), int(np.mean(pos_days)) if pos_days else 0
+                score += self._pct_contrib(mp, md, '商品持仓分位(多品种均值)', 16, details)
+            else:
+                details.append('商品持仓分位: 数据不足')
+        except Exception as e:
+            details.append(f"评分计算出错: {e}")
+        return {'score': self._clamp_score(score), 'details': details, 'level': self._get_level(score), 'trend': '→ 持平'}
 
     def score_etf_arbitrage(self):
-        score, details = 50, []
-        if SCORE_WEIGHTS.get('etf'):
-            details.append("已配置 etf 权重但未实现自动解析，请自行实现或保持中性 50 分")
-        else:
-            details.append("未配置 SCORE_WEIGHTS['etf']：不使用波动率/成交额分位等硬编码，评分保持 50")
-        return {'score': score, 'details': details, 'level': self._get_level(score), 'trend': '→ 持平'}
+        score, details = 50.0, []
+        try:
+            a = self.calculator.get_arbitrage_indicators()
+            etfs = ['300ETF', '500ETF', '1000ETF', '50ETF', '创业板ETF', '科创50ETF']
+            vp, vd, ap, ad, pp, pd = [], [], [], [], [], []
+            for e in etfs:
+                p = a.get(f'{e}_volatility_percentile')
+                if p is not None:
+                    vp.append(p)
+                    vd.append(a.get(f'{e}_volatility_percentile_days', 0))
+                p = a.get(f'{e}_amount_percentile')
+                if p is not None:
+                    ap.append(p)
+                    ad.append(a.get(f'{e}_amount_percentile_days', 0))
+                p = a.get(f'{e}_premium_percentile')
+                if p is not None:
+                    pp.append(p)
+                    pd.append(a.get(f'{e}_premium_percentile_days', 0))
+            if vp:
+                score += self._pct_contrib(float(np.mean(vp)), int(np.mean(vd)) if vd else 0, 'ETF波动率分位(均值)', 18, details)
+            else:
+                details.append('ETF波动率分位: 数据不足')
+            if ap:
+                score += self._pct_contrib(float(np.mean(ap)), int(np.mean(ad)) if ad else 0, 'ETF成交额分位(均值)', 16, details)
+            else:
+                details.append('ETF成交额分位: 数据不足')
+            if pp:
+                dev = [abs(x - 50.0) for x in pp]
+                mp = float(np.mean(dev))
+                score += (mp / 50.0) * 14.0
+                details.append(f"ETF折溢价分位偏离度(距50%均值){mp:.1f}%: +{((mp/50.0)*14):.1f}")
+            else:
+                details.append('ETF折溢价分位: 数据不足')
+        except Exception as e:
+            details.append(f"评分计算出错: {e}")
+        return {'score': self._clamp_score(score), 'details': details, 'level': self._get_level(score), 'trend': '→ 持平'}
 
     def score_index_arbitrage(self):
-        score, details = 50, []
-        if SCORE_WEIGHTS.get('index_arb'):
-            details.append("已配置 index_arb 权重但未实现自动解析，请自行实现或保持中性 50 分")
-        else:
-            details.append("未配置 SCORE_WEIGHTS['index_arb']：评分保持 50")
-        return {'score': score, 'details': details, 'level': self._get_level(score), 'trend': '→ 持平'}
+        score, details = 50.0, []
+        try:
+            a = self.calculator.get_arbitrage_indicators()
+            vp, vd, ap, ad = [], [], [], []
+            for f in ['IF', 'IC', 'IM']:
+                p = a.get(f'{f}_volatility_percentile')
+                if p is not None:
+                    vp.append(p)
+                    vd.append(a.get(f'{f}_volatility_percentile_days', 0))
+                p = a.get(f'{f}_amount_percentile')
+                if p is not None:
+                    ap.append(p)
+                    ad.append(a.get(f'{f}_amount_percentile_days', 0))
+            if vp:
+                score += self._pct_contrib(float(np.mean(vp)), int(np.mean(vd)) if vd else 0, '股指期货波动率分位(均值)', 22, details)
+            else:
+                details.append('股指期货波动率分位: 数据不足')
+            if ap:
+                score += self._pct_contrib(float(np.mean(ap)), int(np.mean(ad)) if ad else 0, '股指期货成交额分位(均值)', 18, details)
+            else:
+                details.append('股指期货成交额分位: 数据不足')
+        except Exception as e:
+            details.append(f"评分计算出错: {e}")
+        return {'score': self._clamp_score(score), 'details': details, 'level': self._get_level(score), 'trend': '→ 持平'}
 
     def score_option_arbitrage(self):
-        score, details = 50, []
-        if SCORE_WEIGHTS.get('option'):
-            details.append("已配置 option 权重但未实现自动解析，请自行实现或保持中性 50 分")
-        else:
-            details.append("未配置 SCORE_WEIGHTS['option']：评分保持 50")
-        return {'score': score, 'details': details, 'level': self._get_level(score), 'trend': '→ 持平'}
+        score, details = 50.0, []
+        try:
+            a = self.calculator.get_arbitrage_indicators()
+            names = (['50ETF', '300ETF', '500ETF', '科创50ETF', '创业板ETF', '深300ETF']
+                     + ['300股指', '1000股指', '50股指'])
+            pcts, days = [], []
+            for n in names:
+                p = a.get(f'{n}_IV_percentile')
+                if p is not None:
+                    pcts.append(p)
+                    days.append(a.get(f'{n}_IV_percentile_days', 0))
+            if pcts:
+                score += self._pct_contrib(float(np.mean(pcts)), int(np.mean(days)) if days else 0, '期权IV分位(均值)', 26, details)
+                if len(pcts) >= 2:
+                    diff = max(pcts) - min(pcts)
+                    bonus = min(14.0, diff / 50.0 * 14.0)
+                    score += bonus
+                    details.append(f"IV分位跨标的分化(极差{diff:.1f}%): +{bonus:.1f}")
+            else:
+                details.append('期权IV分位: 数据不足')
+        except Exception as e:
+            details.append(f"评分计算出错: {e}")
+        return {'score': self._clamp_score(score), 'details': details, 'level': self._get_level(score), 'trend': '→ 持平'}
 
     def score_market_neutral(self):
-        score, details = 50, []
-        if SCORE_WEIGHTS.get('neutral'):
-            details.append("已配置 neutral 权重但未实现自动解析，请自行实现或保持中性 50 分")
-        else:
-            details.append("未配置 SCORE_WEIGHTS['neutral']：不使用基差/拥挤度硬编码档，评分保持 50")
-        return {'score': score, 'details': details, 'level': self._get_level(score), 'trend': '→ 持平'}
+        score, details = 50.0, []
+        try:
+            n = self.calculator.get_market_neutral_indicators()
+            score += self._contrib_from_series(self._series_market_amount_20d_avg(), '市场20日均成交额(亿元)', 12, details)
+            score += self._contrib_from_series(self._series_crowding('000905.XSHG'), '中证500拥挤度(占全市场%)', 16, details)
+            ic = n.get('IC_basis_annual')
+            im = n.get('IM_basis_annual')
+            ser_mix = self._series_ic_im_annual_basis_avg(count=320)
+            if ser_mix is not None and len(ser_mix) >= 20:
+                pct, days = self.calculator.calculate_percentile_with_days(ser_mix, window=252, min_days=20)
+                score += self._pct_contrib(pct, days, 'IC+IM年化基差(逐日合成)历史分位', 24, details)
+            elif ic is not None and im is not None:
+                details.append(f"IC+IM年化基差当前({(ic+im)/2:.2f}%): 历史序列不足，未打分位")
+            else:
+                details.append('IC/IM年化基差: 数据不足')
+            ps = n.get('pattern_signal')
+            if ps is not None and ps != 0:
+                adj = -6.0 * float(ps)
+                score += adj
+                details.append(f"市场形态信号({ps}): {adj:+.1f}")
+        except Exception as e:
+            details.append(f"评分计算出错: {e}")
+        return {'score': self._clamp_score(score), 'details': details, 'level': self._get_level(score), 'trend': '→ 持平'}
+
+    def _series_futures_annual_basis(self, future_code, index_code, count=320):
+        """逐日 (期货收-指数收)/指数收*400 作为年化基差近似序列。"""
+        try:
+            df_f = self.calculator.fetcher.get_futures_main_contract(future_code, period=count)
+            df_i = self.calculator.fetcher.get_index_daily(index_code, period=count)
+            if df_f is None or df_i is None or df_f.empty or df_i.empty:
+                return None
+            df_f = df_f.sort_values('日期').set_index('日期')['收盘价']
+            df_i = df_i.sort_values('日期').set_index('日期')['收盘']
+            m = pd.concat([df_f, df_i], axis=1, join='inner').dropna()
+            if len(m) < 20:
+                return None
+            raw = (m.iloc[:, 0] / m.iloc[:, 1] - 1.0) * 100.0 * 4.0
+            return raw.dropna()
+        except Exception:
+            return None
+
+    def _series_ic_im_annual_basis_avg(self, count=320):
+        s_ic = self._series_futures_annual_basis('IC', '000905.XSHG', count)
+        s_im = self._series_futures_annual_basis('IM', '000852.XSHG', count)
+        if s_ic is None or s_im is None:
+            return None
+        m = pd.concat([s_ic, s_im], axis=1, join='inner').dropna()
+        if m.empty or len(m) < 20:
+            return None
+        return ((m.iloc[:, 0] + m.iloc[:, 1]) / 2.0)
     
     def _get_level(self, score):
         """根据分数获取适配环境等级"""

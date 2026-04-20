@@ -11,6 +11,24 @@ from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 # 聚宽数据API导入
 from jqdata import *
 
+# 评分用阈值与加减分：不在代码里写死数值，避免用不准确的常数代替真实数据。
+# 需要打分时在此字典中填写，例如：
+# SCORE_WEIGHTS = {
+#     'subjective': {
+#         'market_amount_high': (10000, 12),   # (阈值亿元, 加分)
+#         'market_amount_low': (6000, -12),
+#         'pe_pct_cheap': (30, 18), 'pe_pct_expensive': (70, -18),
+#         'gv_ratio_high': (2, 10), 'gv_ratio_low': (-2, -10),
+#         'amount_change_high': (10, 8), 'amount_change_low': (-10, -8),
+#     },
+#     'quant': {
+#         'market_amount_high': (10000, 10), 'market_amount_low': (6000, -10),
+#         'crowding_high': (20, -15), 'crowding_low': (10, 15),
+#     },
+# }
+# 各策略评分函数在 SCORE_WEIGHTS 为空时一律保持 50 分并列明原因，避免用硬编码常数冒充数据。
+SCORE_WEIGHTS = {}
+
 # ============================================
 # 数据获取模块 - 使用聚宽API
 # ============================================
@@ -361,61 +379,7 @@ class IndicatorCalculator:
                     indicators['market_divergence_percentile'] = percentile
                     indicators['market_divergence_percentile_days'] = days
             
-            # --- 一九行情指数（0-100综合评分） ---
-            yijiu_score = 50  # 基准分50，中性状态
-            
-            # 维度1：当日分化度（权重30%）
-            # 阈值：日分化度 > 0.05% 为轻度一九，> 0.15% 为明显一九
-            if latest_divergence > 0.15:
-                yijiu_score += 15
-            elif latest_divergence > 0.05:
-                yijiu_score += 8
-            elif latest_divergence < -0.15:
-                yijiu_score -= 15
-            elif latest_divergence < -0.05:
-                yijiu_score -= 8
-            
-            # 维度2：20日累计分化度（权重40%）
-            divergence_20d = indicators.get('market_divergence_20d', 0)
-            if divergence_20d > 2.0:
-                yijiu_score += 20
-            elif divergence_20d > 1.0:
-                yijiu_score += 12
-            elif divergence_20d > 0.3:
-                yijiu_score += 5
-            elif divergence_20d < -2.0:
-                yijiu_score -= 20
-            elif divergence_20d < -1.0:
-                yijiu_score -= 12
-            elif divergence_20d < -0.3:
-                yijiu_score -= 5
-            
-            # 维度3：历史分位数（权重30%）
-            pct = indicators.get('market_divergence_percentile')
-            if pct is not None:
-                if pct > 80:
-                    yijiu_score += 15
-                elif pct > 60:
-                    yijiu_score += 8
-                elif pct < 20:
-                    yijiu_score -= 15
-                elif pct < 40:
-                    yijiu_score -= 8
-            
-            yijiu_score = max(0, min(100, yijiu_score))
-            indicators['yijiu_index'] = yijiu_score
-            
-            # 生成文字描述
-            if yijiu_score >= 75:
-                indicators['yijiu_level'] = '强一九行情'
-            elif yijiu_score >= 60:
-                indicators['yijiu_level'] = '偏一九行情'
-            elif yijiu_score >= 40:
-                indicators['yijiu_level'] = '市场均衡'
-            elif yijiu_score >= 25:
-                indicators['yijiu_level'] = '偏九一行情'
-            else:
-                indicators['yijiu_level'] = '强九一行情'
+            # 不再内置「一九指数」主观阈值打分；仅输出分化度序列，供自行配置 SCORE_WEIGHTS 后评分
             
         except Exception as e:
             print(f"计算一九行情指标失败: {e}")
@@ -968,618 +932,66 @@ class IndicatorCalculator:
 # ============================================
 
 class StrategyScorer:
-    """策略评分类"""
+    """策略评分类：不在代码中写死阈值与加减分；请配置全局 SCORE_WEIGHTS 后扩展 _score_from_weights。"""
     
     def __init__(self):
         self.calculator = IndicatorCalculator()
-        
-        self.thresholds = {
-            'subjective': {
-                'market_amount': {'high': 10000, 'low': 6000},
-                'price_percentile': {'cheap': 30, 'expensive': 70},
-            },
-            'quant': {
-                'crowding': {'high': 20, 'low': 10},
-                'yijiu': {'strong_yijiu': 75, 'mild_yijiu': 60, 'balanced': 40, 'mild_jiuyi': 25},
-            },
-            'cta': {
-                'volatility': {'high': 25, 'low': 15},
-            },
-            'arbitrage': {
-                'basis': {'high': -0.5, 'low': -2},
-                'etf_volatility_percentile': {'high': 70, 'low': 30},
-            },
-            'neutral': {
-                'basis_annual': {'high': 4, 'low': 0},
-            }
-        }
-    
+
     def score_subjective_long(self):
-        """主观多头策略评分 - 使用PE分位数估值"""
-        score = 50
-        details = []
-        
-        try:
-            sentiment = self.calculator.get_sentiment_indicators()
-            valuation = self.calculator.get_valuation_indicators()
-            
-            # 1. 成交额评分 (25%)
-            market_amount = sentiment.get('market_amount_20d_avg', 8000)
-            if market_amount > self.thresholds['subjective']['market_amount']['high']:
-                score += 12
-                details.append(f"成交活跃({market_amount:.0f}亿): +12")
-            elif market_amount < self.thresholds['subjective']['market_amount']['low']:
-                score -= 12
-                details.append(f"成交萎缩({market_amount:.0f}亿): -12")
-            else:
-                details.append(f"成交正常({market_amount:.0f}亿): 0")
-            
-            # 2. 估值评分 (35%) - 使用PE分位数
-            pe_pct = valuation.get('沪深300_PE_percentile')
-            pe_days = valuation.get('沪深300_PE_percentile_days', 0)
-            current_pe = valuation.get('沪深300_PE', 0)
-            
-            if pe_pct is not None:
-                if pe_pct < 30:
-                    score += 18
-                    details.append(f"PE估值偏低({current_pe:.1f}倍, 分位{pe_pct:.0f}%, {pe_days}天): +18")
-                elif pe_pct > 70:
-                    score -= 18
-                    details.append(f"PE估值偏高({current_pe:.1f}倍, 分位{pe_pct:.0f}%, {pe_days}天): -18")
-                else:
-                    details.append(f"PE估值适中({current_pe:.1f}倍, 分位{pe_pct:.0f}%, {pe_days}天): 0")
-            else:
-                details.append(f"PE估值数据不足({current_pe:.1f}倍): 0")
-            
-            # 3. 成长价值比价 (25%)
-            gv_ratio = valuation.get('growth_value_ratio', 0)
-            if gv_ratio > 2:
-                score += 10
-                details.append(f"成长风格强势(+{gv_ratio:.1f}%): +10")
-            elif gv_ratio < -2:
-                score -= 10
-                details.append(f"价值风格强势({gv_ratio:.1f}%): -10")
-            else:
-                details.append(f"风格均衡({gv_ratio:.1f}%): 0")
-            
-            # 4. 成交额变化 (15%)
-            amount_change = sentiment.get('market_amount_change_20d', 0)
-            if amount_change > 10:
-                score += 8
-                details.append(f"成交明显改善(+{amount_change:.1f}%): +8")
-            elif amount_change < -10:
-                score -= 8
-                details.append(f"成交明显萎缩({amount_change:.1f}%): -8")
-            else:
-                details.append(f"成交变化平稳({amount_change:.1f}%): 0")
-            
-        except Exception as e:
-            details.append(f"评分计算出错: {e}")
-        
-        score = max(0, min(100, score))
-        
-        return {
-            'score': score,
-            'details': details,
-            'level': self._get_level(score),
-            'trend': '→ 持平'
-        }
-    
+        score, details = 50, []
+        if SCORE_WEIGHTS.get('subjective'):
+            details.append("已配置 subjective 权重但未实现自动解析，请自行实现或保持中性 50 分")
+        else:
+            details.append("未配置 SCORE_WEIGHTS['subjective']：不代入默认成交额/PE 等占位，评分保持 50")
+        return {'score': score, 'details': details, 'level': self._get_level(score), 'trend': '→ 持平'}
+
     def score_quant_long(self):
-        """量化多头策略评分"""
-        score = 50
-        details = []
-        
-        try:
-            quant_indicators = self.calculator.get_quant_indicators()
-            
-            # 市场活跃度 (20%)
-            market_amount = quant_indicators.get('market_amount_20d_avg', 8000)
-            if market_amount > 10000:
-                score += 10
-                details.append(f"成交活跃({market_amount:.0f}亿): +10")
-            elif market_amount < 6000:
-                score -= 10
-                details.append(f"成交萎缩({market_amount:.0f}亿): -10")
-            else:
-                details.append(f"成交正常({market_amount:.0f}亿): 0")
-            
-            # 拥挤度 (45%)
-            crowding_1000 = quant_indicators.get('中证1000_crowding', 15)
-            if crowding_1000 > self.thresholds['quant']['crowding']['high']:
-                score -= 15
-                details.append(f"小盘拥挤度高({crowding_1000:.1f}%): -15")
-            elif crowding_1000 < self.thresholds['quant']['crowding']['low']:
-                score += 15
-                details.append(f"小盘拥挤度低({crowding_1000:.1f}%): +15")
-            else:
-                details.append(f"小盘拥挤度正常({crowding_1000:.1f}%): 0")
-            
-            # 一九行情指数 (35%) - 强一九行情不利于量化多头策略
-            yijiu = quant_indicators.get('yijiu_index')
-            yijiu_level = quant_indicators.get('yijiu_level', '未知')
-            divergence_20d = quant_indicators.get('market_divergence_20d')
-            divergence_pct = quant_indicators.get('market_divergence_percentile')
-            
-            if yijiu is not None:
-                if yijiu >= 75:
-                    score -= 15
-                    pct_str = f", 分位{divergence_pct:.0f}%" if divergence_pct is not None else ""
-                    d20_str = f", 20日累计{divergence_20d:.2f}%" if divergence_20d is not None else ""
-                    details.append(f"一九行情指数({yijiu}分/{yijiu_level}{d20_str}{pct_str}): -15")
-                elif yijiu >= 60:
-                    score -= 8
-                    pct_str = f", 分位{divergence_pct:.0f}%" if divergence_pct is not None else ""
-                    d20_str = f", 20日累计{divergence_20d:.2f}%" if divergence_20d is not None else ""
-                    details.append(f"一九行情指数({yijiu}分/{yijiu_level}{d20_str}{pct_str}): -8")
-                elif yijiu <= 25:
-                    score += 10
-                    pct_str = f", 分位{divergence_pct:.0f}%" if divergence_pct is not None else ""
-                    d20_str = f", 20日累计{divergence_20d:.2f}%" if divergence_20d is not None else ""
-                    details.append(f"一九行情指数({yijiu}分/{yijiu_level}{d20_str}{pct_str}): +10")
-                elif yijiu <= 40:
-                    score += 5
-                    pct_str = f", 分位{divergence_pct:.0f}%" if divergence_pct is not None else ""
-                    d20_str = f", 20日累计{divergence_20d:.2f}%" if divergence_20d is not None else ""
-                    details.append(f"一九行情指数({yijiu}分/{yijiu_level}{d20_str}{pct_str}): +5")
-                else:
-                    pct_str = f", 分位{divergence_pct:.0f}%" if divergence_pct is not None else ""
-                    d20_str = f", 20日累计{divergence_20d:.2f}%" if divergence_20d is not None else ""
-                    details.append(f"一九行情指数({yijiu}分/{yijiu_level}{d20_str}{pct_str}): 0")
-            else:
-                details.append("一九行情指数数据不足: 0")
-            
-        except Exception as e:
-            details.append(f"评分计算出错: {e}")
-        
-        score = max(0, min(100, score))
-        
-        return {
-            'score': score,
-            'details': details,
-            'level': self._get_level(score),
-            'trend': '→ 持平'
-        }
-    
+        score, details = 50, []
+        if SCORE_WEIGHTS.get('quant'):
+            details.append("已配置 quant 权重但未实现自动解析，请自行实现或保持中性 50 分")
+        else:
+            details.append("未配置 SCORE_WEIGHTS['quant']：不使用拥挤度/一九指数等硬编码阈值，评分保持 50")
+        return {'score': score, 'details': details, 'level': self._get_level(score), 'trend': '→ 持平'}
+
     def score_cta(self):
-        """CTA策略评分 - 使用分位数打分"""
-        score = 50
-        details = []
-        
-        try:
-            cta_indicators = self.calculator.get_cta_indicators()
-            
-            # 1. 商品期货波动率分位数 (50%) - 使用分位数打分
-            vol_percentiles = []
-            vol_days_list = []
-            for symbol in ['RB', 'CU', 'SC', 'M', 'I', 'AU']:
-                pct = cta_indicators.get(f'{symbol}_volatility_percentile')
-                days = cta_indicators.get(f'{symbol}_volatility_percentile_days', 0)
-                if pct is not None:
-                    vol_percentiles.append(pct)
-                    vol_days_list.append(days)
-            
-            if vol_percentiles:
-                avg_vol_percentile = np.mean(vol_percentiles)
-                avg_days = int(np.mean(vol_days_list)) if vol_days_list else 0
-                
-                if avg_vol_percentile > 70:
-                    score += 20
-                    details.append(f"商品波动率分位高({avg_vol_percentile:.0f}%, {avg_days}天): +20")
-                elif avg_vol_percentile > 30:
-                    score += 10
-                    details.append(f"商品波动率分位适中({avg_vol_percentile:.0f}%, {avg_days}天): +10")
-                else:
-                    score -= 10
-                    details.append(f"商品波动率分位低({avg_vol_percentile:.0f}%, {avg_days}天): -10")
-            else:
-                details.append("商品波动率分位数据不足: 0")
-            
-            # 2. 商品期货成交量分位数 (25%) - 使用分位数打分
-            volume_percentiles = []
-            volume_days_list = []
-            for symbol in ['RB', 'CU', 'SC', 'M', 'I', 'AU']:
-                pct = cta_indicators.get(f'{symbol}_volume_percentile')
-                days = cta_indicators.get(f'{symbol}_volume_percentile_days', 0)
-                if pct is not None:
-                    volume_percentiles.append(pct)
-                    volume_days_list.append(days)
-            
-            if volume_percentiles:
-                avg_vol_pct = np.mean(volume_percentiles)
-                avg_days = int(np.mean(volume_days_list)) if volume_days_list else 0
-                
-                if avg_vol_pct > 70:
-                    score += 12
-                    details.append(f"商品成交量分位高({avg_vol_pct:.0f}%, {avg_days}天): +12")
-                elif avg_vol_pct > 30:
-                    score += 6
-                    details.append(f"商品成交量分位适中({avg_vol_pct:.0f}%, {avg_days}天): +6")
-                else:
-                    score -= 6
-                    details.append(f"商品成交量分位低({avg_vol_pct:.0f}%, {avg_days}天): -6")
-            else:
-                details.append("商品成交量分位数据不足: 0")
-            
-            # 3. 商品期货持仓量分位数 (25%) - 使用分位数打分
-            pos_percentiles = []
-            pos_days_list = []
-            for symbol in ['RB', 'CU', 'SC', 'M', 'I', 'AU']:
-                pct = cta_indicators.get(f'{symbol}_positions_percentile')
-                days = cta_indicators.get(f'{symbol}_positions_percentile_days', 0)
-                if pct is not None:
-                    pos_percentiles.append(pct)
-                    pos_days_list.append(days)
-            
-            if pos_percentiles:
-                avg_pos_pct = np.mean(pos_percentiles)
-                avg_days = int(np.mean(pos_days_list)) if pos_days_list else 0
-                
-                if avg_pos_pct > 70:
-                    score += 12
-                    details.append(f"商品持仓量分位高({avg_pos_pct:.0f}%, {avg_days}天): +12")
-                elif avg_pos_pct > 30:
-                    score += 6
-                    details.append(f"商品持仓量分位适中({avg_pos_pct:.0f}%, {avg_days}天): +6")
-                else:
-                    score -= 6
-                    details.append(f"商品持仓量分位低({avg_pos_pct:.0f}%, {avg_days}天): -6")
-            else:
-                details.append("商品持仓量分位数据不足: 0")
-            
-        except Exception as e:
-            details.append(f"评分计算出错: {e}")
-        
-        score = max(0, min(100, score))
-        
-        return {
-            'score': score,
-            'details': details,
-            'level': self._get_level(score),
-            'trend': '→ 持平'
-        }
-    
+        score, details = 50, []
+        if SCORE_WEIGHTS.get('cta'):
+            details.append("已配置 cta 权重但未实现自动解析，请自行实现或保持中性 50 分")
+        else:
+            details.append("未配置 SCORE_WEIGHTS['cta']：不使用分位数硬编码阈值，评分保持 50")
+        return {'score': score, 'details': details, 'level': self._get_level(score), 'trend': '→ 持平'}
+
     def score_etf_arbitrage(self):
-        """ETF套利策略评分 - 使用分位数打分"""
-        score = 50
-        details = []
-        
-        try:
-            arb_indicators = self.calculator.get_arbitrage_indicators()
-            
-            # 1. ETF波动率分位数 (35%) - 综合多个ETF
-            vol_percentiles = []
-            vol_days_list = []
-            for etf in ['300ETF', '500ETF', '1000ETF', '50ETF', '创业板ETF', '科创50ETF']:
-                pct = arb_indicators.get(f'{etf}_volatility_percentile')
-                days = arb_indicators.get(f'{etf}_volatility_percentile_days', 0)
-                if pct is not None:
-                    vol_percentiles.append(pct)
-                    vol_days_list.append(days)
-            
-            if vol_percentiles:
-                avg_vol_pct = np.mean(vol_percentiles)
-                avg_days = int(np.mean(vol_days_list)) if vol_days_list else 0
-                
-                if avg_vol_pct > 70:
-                    score += 15
-                    details.append(f"ETF波动率分位高({avg_vol_pct:.0f}%, {avg_days}天): +15")
-                elif avg_vol_pct < 30:
-                    score -= 10
-                    details.append(f"ETF波动率分位低({avg_vol_pct:.0f}%, {avg_days}天): -10")
-                else:
-                    details.append(f"ETF波动率分位适中({avg_vol_pct:.0f}%, {avg_days}天): 0")
-            else:
-                details.append("ETF波动率分位数据不足: 0")
-            
-            # 2. ETF折溢价率分位数 (40%) - 使用分位数打分
-            premium_percentiles = []
-            premium_days_list = []
-            for etf in ['300ETF', '500ETF', '1000ETF', '50ETF', '创业板ETF', '科创50ETF']:
-                pct = arb_indicators.get(f'{etf}_premium_percentile')
-                days = arb_indicators.get(f'{etf}_premium_percentile_days', 0)
-                if pct is not None:
-                    premium_percentiles.append(pct)
-                    premium_days_list.append(days)
-            
-            if premium_percentiles:
-                avg_premium_pct = np.mean(premium_percentiles)
-                avg_days = int(np.mean(premium_days_list)) if premium_days_list else 0
-                
-                # 折溢价率分位数在30%-70%之间为正常，偏离越大机会越大
-                if avg_premium_pct > 80 or avg_premium_pct < 20:
-                    score += 18
-                    details.append(f"ETF折溢价分位极端({avg_premium_pct:.0f}%, {avg_days}天): +18")
-                elif avg_premium_pct > 70 or avg_premium_pct < 30:
-                    score += 10
-                    details.append(f"ETF折溢价分位偏离({avg_premium_pct:.0f}%, {avg_days}天): +10")
-                else:
-                    details.append(f"ETF折溢价分位正常({avg_premium_pct:.0f}%, {avg_days}天): 0")
-            else:
-                details.append("ETF折溢价分位数据不足: 0")
-            
-            # 3. ETF成交额分位数 (25%) - 使用分位数打分
-            amount_percentiles = []
-            amount_days_list = []
-            for etf in ['300ETF', '500ETF', '1000ETF', '50ETF', '创业板ETF', '科创50ETF']:
-                pct = arb_indicators.get(f'{etf}_amount_percentile')
-                days = arb_indicators.get(f'{etf}_amount_percentile_days', 0)
-                if pct is not None:
-                    amount_percentiles.append(pct)
-                    amount_days_list.append(days)
-            
-            if amount_percentiles:
-                avg_amt_pct = np.mean(amount_percentiles)
-                avg_days = int(np.mean(amount_days_list)) if amount_days_list else 0
-                
-                if avg_amt_pct > 70:
-                    score += 10
-                    details.append(f"ETF成交额分位高({avg_amt_pct:.0f}%, {avg_days}天): +10")
-                elif avg_amt_pct < 30:
-                    score -= 5
-                    details.append(f"ETF成交额分位低({avg_amt_pct:.0f}%, {avg_days}天): -5")
-                else:
-                    details.append(f"ETF成交额分位正常({avg_amt_pct:.0f}%, {avg_days}天): 0")
-            else:
-                details.append("ETF成交额分位数据不足: 0")
-            
-        except Exception as e:
-            details.append(f"评分计算出错: {e}")
-        
-        score = max(0, min(100, score))
-        
-        return {
-            'score': score,
-            'details': details,
-            'level': self._get_level(score),
-            'trend': '→ 持平'
-        }
-    
+        score, details = 50, []
+        if SCORE_WEIGHTS.get('etf'):
+            details.append("已配置 etf 权重但未实现自动解析，请自行实现或保持中性 50 分")
+        else:
+            details.append("未配置 SCORE_WEIGHTS['etf']：不使用波动率/成交额分位等硬编码，评分保持 50")
+        return {'score': score, 'details': details, 'level': self._get_level(score), 'trend': '→ 持平'}
+
     def score_index_arbitrage(self):
-        """股指高频套利策略评分 - 使用分位数打分"""
-        score = 50
-        details = []
-        
-        try:
-            arb_indicators = self.calculator.get_arbitrage_indicators()
-            
-            # 1. 股指期货波动率分位数 (40%) - 使用分位数打分
-            vol_percentiles = []
-            vol_days_list = []
-            for future in ['IF', 'IC', 'IM']:
-                pct = arb_indicators.get(f'{future}_volatility_percentile')
-                days = arb_indicators.get(f'{future}_volatility_percentile_days', 0)
-                if pct is not None:
-                    vol_percentiles.append(pct)
-                    vol_days_list.append(days)
-            
-            if vol_percentiles:
-                avg_vol_pct = np.mean(vol_percentiles)
-                avg_days = int(np.mean(vol_days_list)) if vol_days_list else 0
-                
-                if avg_vol_pct > 70:
-                    score += 16
-                    details.append(f"股指波动率分位高({avg_vol_pct:.0f}%, {avg_days}天): +16")
-                elif avg_vol_pct > 30:
-                    score += 8
-                    details.append(f"股指波动率分位适中({avg_vol_pct:.0f}%, {avg_days}天): +8")
-                else:
-                    score -= 8
-                    details.append(f"股指波动率分位低({avg_vol_pct:.0f}%, {avg_days}天): -8")
-            else:
-                details.append("股指波动率分位数据不足: 0")
-            
-            # 2. 股指期货成交额分位数 (35%) - 使用分位数打分
-            amt_percentiles = []
-            amt_days_list = []
-            for future in ['IF', 'IC', 'IM']:
-                pct = arb_indicators.get(f'{future}_amount_percentile')
-                days = arb_indicators.get(f'{future}_amount_percentile_days', 0)
-                if pct is not None:
-                    amt_percentiles.append(pct)
-                    amt_days_list.append(days)
-            
-            if amt_percentiles:
-                avg_amt_pct = np.mean(amt_percentiles)
-                avg_days = int(np.mean(amt_days_list)) if amt_days_list else 0
-                
-                if avg_amt_pct > 70:
-                    score += 14
-                    details.append(f"股指成交额分位高({avg_amt_pct:.0f}%, {avg_days}天): +14")
-                elif avg_amt_pct > 30:
-                    score += 7
-                    details.append(f"股指成交额分位适中({avg_amt_pct:.0f}%, {avg_days}天): +7")
-                else:
-                    score -= 7
-                    details.append(f"股指成交额分位低({avg_amt_pct:.0f}%, {avg_days}天): -7")
-            else:
-                details.append("股指成交额分位数据不足: 0")
-            
-            # 3. 股指期货波动率绝对值参考 (25%) - 辅助判断
-            if_vol = arb_indicators.get('IF_volatility_20d')
-            ic_vol = arb_indicators.get('IC_volatility_20d')
-            im_vol = arb_indicators.get('IM_volatility_20d')
-            vols = [v for v in [if_vol, ic_vol, im_vol] if v is not None]
-            
-            if vols:
-                avg_vol = np.mean(vols)
-                if avg_vol > 25:
-                    score += 8
-                    details.append(f"股指波动率绝对值高({avg_vol:.1f}%): +8")
-                elif avg_vol < 10:
-                    score -= 5
-                    details.append(f"股指波动率绝对值低({avg_vol:.1f}%): -5")
-                else:
-                    details.append(f"股指波动率绝对值适中({avg_vol:.1f}%): 0")
-            else:
-                details.append("股指波动率绝对值数据不足: 0")
-            
-        except Exception as e:
-            details.append(f"评分计算出错: {e}")
-        
-        score = max(0, min(100, score))
-        
-        return {
-            'score': score,
-            'details': details,
-            'level': self._get_level(score),
-            'trend': '→ 持平'
-        }
-    
+        score, details = 50, []
+        if SCORE_WEIGHTS.get('index_arb'):
+            details.append("已配置 index_arb 权重但未实现自动解析，请自行实现或保持中性 50 分")
+        else:
+            details.append("未配置 SCORE_WEIGHTS['index_arb']：评分保持 50")
+        return {'score': score, 'details': details, 'level': self._get_level(score), 'trend': '→ 持平'}
+
     def score_option_arbitrage(self):
-        """期权套利策略评分 - 使用分位数打分"""
-        score = 50
-        details = []
-        
-        try:
-            arb_indicators = self.calculator.get_arbitrage_indicators()
-            
-            # 收集所有可用的IV分位数和天数
-            iv_percentiles = []
-            iv_days_list = []
-            
-            # ETF期权IV分位数
-            etf_names = ['50ETF', '300ETF', '500ETF', '科创50ETF', '创业板ETF', '深300ETF']
-            for name in etf_names:
-                pct = arb_indicators.get(f'{name}_IV_percentile')
-                days = arb_indicators.get(f'{name}_IV_percentile_days', 0)
-                if pct is not None:
-                    iv_percentiles.append(pct)
-                    iv_days_list.append(days)
-            
-            # 股指期权IV分位数
-            index_names = ['300股指', '1000股指', '50股指']
-            for name in index_names:
-                pct = arb_indicators.get(f'{name}_IV_percentile')
-                days = arb_indicators.get(f'{name}_IV_percentile_days', 0)
-                if pct is not None:
-                    iv_percentiles.append(pct)
-                    iv_days_list.append(days)
-            
-            # 商品期权IV分位数
-            commodity_names = ['铜期权', '豆粕期权', '白糖期权', '棉花期权']
-            for name in commodity_names:
-                pct = arb_indicators.get(f'{name}_IV_percentile')
-                days = arb_indicators.get(f'{name}_IV_percentile_days', 0)
-                if pct is not None:
-                    iv_percentiles.append(pct)
-                    iv_days_list.append(days)
-            
-            # 1. 综合隐含波动率分位数 (60%) - 使用分位数打分
-            if len(iv_percentiles) > 0:
-                avg_iv_pct = np.mean(iv_percentiles)
-                avg_days = int(np.mean([d for d in iv_days_list if d > 0])) if any(d > 0 for d in iv_days_list) else 0
-                
-                if avg_iv_pct > 70:
-                    score += 25
-                    details.append(f"综合IV分位高({avg_iv_pct:.0f}%, {avg_days}天): +25")
-                elif avg_iv_pct > 30:
-                    score += 12
-                    details.append(f"综合IV分位适中({avg_iv_pct:.0f}%, {avg_days}天): +12")
-                else:
-                    score -= 12
-                    details.append(f"综合IV分位低({avg_iv_pct:.0f}%, {avg_days}天): -12")
-            else:
-                details.append("IV分位数据缺失: 0")
-            
-            # 2. IV分化 (40%) - 使用分位数计算分化
-            if len(iv_percentiles) >= 2:
-                iv_diff = max(iv_percentiles) - min(iv_percentiles)
-                if iv_diff > 20:
-                    score += 15
-                    details.append(f"IV分位分化大({iv_diff:.0f}%): +15")
-                elif iv_diff > 10:
-                    score += 8
-                    details.append(f"IV分位分化适中({iv_diff:.0f}%): +8")
-                else:
-                    details.append(f"IV分位分化小({iv_diff:.0f}%): 0")
-            else:
-                details.append("IV分位分化数据不足: 0")
-            
-        except Exception as e:
-            details.append(f"评分计算出错: {e}")
-        
-        score = max(0, min(100, score))
-        
-        return {
-            'score': score,
-            'details': details,
-            'level': self._get_level(score),
-            'trend': '→ 持平'
-        }
-    
+        score, details = 50, []
+        if SCORE_WEIGHTS.get('option'):
+            details.append("已配置 option 权重但未实现自动解析，请自行实现或保持中性 50 分")
+        else:
+            details.append("未配置 SCORE_WEIGHTS['option']：评分保持 50")
+        return {'score': score, 'details': details, 'level': self._get_level(score), 'trend': '→ 持平'}
+
     def score_market_neutral(self):
-        """市场中性策略评分 - 基差=(期货-现货)/现货，负为贴水需付成本，正为升水有收益"""
-        score = 50
-        details = []
-        
-        try:
-            neutral_indicators = self.calculator.get_market_neutral_indicators()
-            
-            # 股指期货基差 (60%) - 基差=(期货-现货)/现货
-            # 基差为负：贴水，做空期货需要支付成本（期货到期收敛到现货，做空亏钱）
-            # 基差为正：升水，做空期货可以获得收益（期货到期收敛到现货，做空赚钱）
-            ic_basis = neutral_indicators.get('IC_basis_annual', 0)
-            im_basis = neutral_indicators.get('IM_basis_annual', 0)
-            avg_basis = (ic_basis + im_basis) / 2 if ic_basis and im_basis else 0
-            
-            if avg_basis > 4:  # 深度升水，对冲收益高
-                score += 25
-                details.append(f"深度升水收益高(年化{avg_basis:.2f}%): +25")
-            elif avg_basis > 2:  # 轻度升水，有对冲收益
-                score += 15
-                details.append(f"轻度升水有收益(年化{avg_basis:.2f}%): +15")
-            elif avg_basis > 0:  # 接近平水，收益较低
-                score += 5
-                details.append(f"接近平水收益低(年化{avg_basis:.2f}%): +5")
-            elif avg_basis > -2:  # 轻度贴水，成本较低
-                score -= 10
-                details.append(f"轻度贴水成本较低(年化{avg_basis:.2f}%): -10")
-            elif avg_basis > -4:  # 中度贴水，成本较高
-                score -= 20
-                details.append(f"中度贴水成本较高(年化{avg_basis:.2f}%): -20")
-            else:  # 深度贴水，成本太高
-                score -= 30
-                details.append(f"深度贴水成本太高(年化{avg_basis:.2f}%): -30")
-            
-            # 拥挤度 (30%) - 使用分位数逻辑（拥挤度本身就是分位数概念）
-            crowding_500 = neutral_indicators.get('中证500_crowding', 15)
-            if crowding_500 > 20:  # 拥挤度高，分位高
-                score -= 12
-                details.append(f"中盘拥挤度高({crowding_500:.1f}%): -12")
-            elif crowding_500 < 10:  # 拥挤度低，分位低
-                score += 12
-                details.append(f"中盘拥挤度低({crowding_500:.1f}%): +12")
-            else:
-                details.append(f"中盘拥挤度正常({crowding_500:.1f}%): 0")
-            
-            # 市场形态 (10%) - 哑铃型/纺锤型判断
-            # 哑铃型：两头（大盘+小盘）强于中间（中盘），风格分化大，对冲难度↑
-            # 纺锤型：中间（中盘）强于两头（大盘+小盘），风格集中，对冲难度↓
-            pattern = neutral_indicators.get('market_pattern', '无形态变化')
-            pattern_signal = neutral_indicators.get('pattern_signal', 0)
-            dumbbell_index = neutral_indicators.get('dumbbell_index', 0)
-            
-            if pattern_signal == 1:  # 哑铃型（向上突破）
-                score -= 8
-                details.append(f"哑铃型市场(分化大，对冲难度↑，指数={dumbbell_index:.2f}%): -8")
-            elif pattern_signal == -1:  # 纺锤型（向下突破）
-                score += 8
-                details.append(f"纺锤型市场(分化小，对冲难度↓，指数={dumbbell_index:.2f}%): +8")
-            else:
-                details.append(f"无形态变化(指数={dumbbell_index:.2f}%): 0")
-            
-        except Exception as e:
-            details.append(f"评分计算出错: {e}")
-        
-        score = max(0, min(100, score))
-        
-        return {
-            'score': score,
-            'details': details,
-            'level': self._get_level(score),
-            'trend': '→ 持平'
-        }
+        score, details = 50, []
+        if SCORE_WEIGHTS.get('neutral'):
+            details.append("已配置 neutral 权重但未实现自动解析，请自行实现或保持中性 50 分")
+        else:
+            details.append("未配置 SCORE_WEIGHTS['neutral']：不使用基差/拥挤度硬编码档，评分保持 50")
+        return {'score': score, 'details': details, 'level': self._get_level(score), 'trend': '→ 持平'}
     
     def _get_level(self, score):
         """根据分数获取适配环境等级"""
@@ -1893,8 +1305,6 @@ class ExcelReportGenerator:
             'market_divergence_20d': '近20日分化度累计值，持续正值表示一九行情持续',
             'market_divergence_percentile': '20日累计分化度在近一年中的历史分位数',
             'market_divergence_percentile_days': '计算分化度分位数所用的历史天数',
-            'yijiu_index': '一九行情综合指数（0-100），越高表示一九行情越明显',
-            'yijiu_level': '一九行情强度等级文字描述'
         }
         
         indicator_units = {
@@ -1906,17 +1316,13 @@ class ExcelReportGenerator:
             'market_divergence_20d': '%',
             'market_divergence_percentile': '%',
             'market_divergence_percentile_days': '天',
-            'yijiu_index': '分',
-            'yijiu_level': ''
         }
         
-        # 按逻辑分组显示，先展示原有指标，再展示一九行情指标
         display_order = [
             'market_amount_20d_avg',
             '沪深300_crowding', '中证500_crowding', '中证1000_crowding',
             'market_divergence_daily', 'market_divergence_20d',
             'market_divergence_percentile', 'market_divergence_percentile_days',
-            'yijiu_index', 'yijiu_level'
         ]
         
         row = 4
@@ -1933,19 +1339,6 @@ class ExcelReportGenerator:
                 ws.cell(row=row, column=2, value=value)
                 ws.cell(row=row, column=3, value=indicator_units.get(name, ''))
                 ws.cell(row=row, column=4, value=indicator_descriptions.get(name, ''))
-                
-                # 一九行情指数高亮
-                if name == 'yijiu_index':
-                    yijiu_val = value
-                    if yijiu_val >= 75:
-                        ws.cell(row=row, column=2).fill = PatternFill(
-                            start_color='FF6B6B', end_color='FF6B6B', fill_type='solid')
-                    elif yijiu_val >= 60:
-                        ws.cell(row=row, column=2).fill = PatternFill(
-                            start_color='FFA07A', end_color='FFA07A', fill_type='solid')
-                    elif yijiu_val <= 25:
-                        ws.cell(row=row, column=2).fill = PatternFill(
-                            start_color='90EE90', end_color='90EE90', fill_type='solid')
                 
                 for col in range(1, 5):
                     cell = ws.cell(row=row, column=col)
@@ -2684,11 +2077,9 @@ def collect_all_indicators():
     quant = calculator.get_quant_indicators()
     all_indicators['quant'] = quant
     print(f"  - 拥挤度指标: {len([k for k in quant.keys() if 'crowding' in k])}个")
-    print(f"  - 一九行情指标: {len([k for k in quant.keys() if 'divergence' in k or 'yijiu' in k])}个")
-    yijiu_idx = quant.get('yijiu_index')
-    yijiu_lvl = quant.get('yijiu_level', '')
-    if yijiu_idx is not None:
-        print(f"  - 一九行情指数: {yijiu_idx}分 ({yijiu_lvl})")
+    print(f"  - 分化度相关指标: {len([k for k in quant.keys() if 'divergence' in k])}个")
+    if quant.get('market_divergence_daily') is not None:
+        print(f"  - 当日市值加权-等权分化度: {quant.get('market_divergence_daily')}")
     
     # 3. CTA指标（仅商品期货）
     print("\n[3/7] 收集CTA策略指标（商品期货）...")

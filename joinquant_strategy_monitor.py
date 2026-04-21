@@ -241,17 +241,6 @@ class IndicatorCalculator:
                             total_net_assets = (df_val['market_cap'] / df_val['pb_ratio']).sum()
                             index_pb = total_market_cap / total_net_assets
                             indicators[f'{name}_PB'] = round(index_pb, 2)
-                            
-                            # 获取历史PE/PB用于计算分位数（简化处理：使用指数价格分位数作为代理）
-                            df_index = self.fetcher.get_index_daily(code, period=252)
-                            if df_index is not None and not df_index.empty:
-                                current_price = df_index['收盘'].iloc[-1]
-                                price_percentile = (df_index['收盘'] < current_price).mean() * 100
-                                # 用价格分位数作为估值分位数的代理（价格越低估值越低）
-                                indicators[f'{name}_PE_percentile'] = round(100 - price_percentile, 2)
-                                indicators[f'{name}_PE_percentile_days'] = len(df_index)
-                                indicators[f'{name}_PB_percentile'] = round(100 - price_percentile, 2)
-                                indicators[f'{name}_PB_percentile_days'] = len(df_index)
                         
             except Exception as e:
                 print(f"获取{name}估值数据失败: {e}")
@@ -986,11 +975,6 @@ class StrategyScorer:
     def score_subjective_long(self):
         score, details = 50.0, []
         try:
-            val = self.calculator.get_sentiment_indicators()
-            valn = self.calculator.get_valuation_indicators()
-            pe_pct = valn.get('沪深300_PE_percentile')
-            pe_days = valn.get('沪深300_PE_percentile_days', 0)
-            score += self._pct_contrib(pe_pct, pe_days, '沪深300估值(价格逆代理分位)', 22, details)
             score += self._contrib_from_series(self._series_market_amount_20d_avg(), '上证20日均成交额(亿元)', 16, details)
             score += self._contrib_from_series(self._series_amount_change_20d(), '上证成交额20日环比(%)', 12, details)
             score += self._contrib_from_series(self._series_growth_value_ratio(), '创业板相对沪深300(20日超额%)', 12, details)
@@ -1394,8 +1378,8 @@ class ExcelReportGenerator:
         
         row += 1  # 空行
         
-        # ===== 第三部分：估值指标（PE/PB） =====
-        ws.cell(row=row, column=1, value='【估值指标 - PE/PB分位数】')
+        # ===== 第三部分：估值指标（当前 PE/PB，不含历史分位数） =====
+        ws.cell(row=row, column=1, value='【估值指标 - 当前 PE/PB】')
         ws.cell(row=row, column=1).font = Font(bold=True, size=11, color='1F4E78')
         ws.merge_cells(f'A{row}:D{row}')
         row += 1
@@ -1409,21 +1393,13 @@ class ExcelReportGenerator:
         
         for idx_code, idx_name in index_valuation:
             pe = indicators.get(f'{idx_code}_PE')
-            pe_pct = indicators.get(f'{idx_code}_PE_percentile')
-            pe_days = indicators.get(f'{idx_code}_PE_percentile_days', 0)
             pb = indicators.get(f'{idx_code}_PB')
-            pb_pct = indicators.get(f'{idx_code}_PB_percentile')
-            pb_days = indicators.get(f'{idx_code}_PB_percentile_days', 0)
             
             if pe is not None:
                 ws.cell(row=row, column=1, value=f'{idx_name} PE')
                 ws.cell(row=row, column=2, value=f"{pe:.2f}倍")
-                if pe_pct is not None:
-                    pct_display = f"{pe_pct}% (基于{pe_days}天)" if pe_days > 0 else f"{pe_pct}%"
-                    ws.cell(row=row, column=3, value=pct_display)
-                else:
-                    ws.cell(row=row, column=3, value='数据不足')
-                ws.cell(row=row, column=4, value=f'{idx_name}市盈率及历史分位数')
+                ws.cell(row=row, column=3, value='倍')
+                ws.cell(row=row, column=4, value=f'{idx_name}市盈率（成分加权，当前截面）')
                 for col in range(1, 5):
                     cell = ws.cell(row=row, column=col)
                     cell.border = Border(left=Side(style='thin'), right=Side(style='thin'),
@@ -1434,12 +1410,8 @@ class ExcelReportGenerator:
             if pb is not None:
                 ws.cell(row=row, column=1, value=f'{idx_name} PB')
                 ws.cell(row=row, column=2, value=f"{pb:.2f}倍")
-                if pb_pct is not None:
-                    pct_display = f"{pb_pct}% (基于{pb_days}天)" if pb_days > 0 else f"{pb_pct}%"
-                    ws.cell(row=row, column=3, value=pct_display)
-                else:
-                    ws.cell(row=row, column=3, value='数据不足')
-                ws.cell(row=row, column=4, value=f'{idx_name}市净率及历史分位数')
+                ws.cell(row=row, column=3, value='倍')
+                ws.cell(row=row, column=4, value=f'{idx_name}市净率（成分加权，当前截面）')
                 for col in range(1, 5):
                     cell = ws.cell(row=row, column=col)
                     cell.border = Border(left=Side(style='thin'), right=Side(style='thin'),
@@ -2268,7 +2240,7 @@ def collect_all_indicators():
     subjective.update(calculator.get_valuation_indicators())
     all_indicators['subjective'] = subjective
     print(f"  - 市场情绪指标: {len([k for k in subjective.keys() if 'amount' in k])}个")
-    print(f"  - 估值指标: {len([k for k in subjective.keys() if 'percentile' in k])}个")
+    print(f"  - 估值指标(PE/PB): {len([k for k in subjective.keys() if k.endswith('_PE') or k.endswith('_PB')])}个")
     
     # 2. 量化多头指标
     print("\n[2/7] 收集量化多头指标...")

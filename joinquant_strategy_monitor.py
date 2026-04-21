@@ -856,7 +856,7 @@ class IndicatorCalculator:
                     'r500': df_500['return']
                 }).dropna()
                 
-                print(f"市场形态指标：合并后数据量={len(df_merged)}天")
+                print("市场形态指标：合并后数据量={}天".format(len(df_merged)))
                 
                 if len(df_merged) >= 6:
                     # 计算哑铃指数 = 国证2000 + 沪深300 - 中证500
@@ -880,18 +880,24 @@ class IndicatorCalculator:
                     if current_dumbbell > current_ma5 and prev_dumbbell <= prev_ma5:
                         indicators['market_pattern'] = '哑铃型'
                         indicators['pattern_signal'] = 1  # 向上突破
-                        print(f"市场形态：哑铃型（哑铃指数={current_dumbbell:.4f}%，MA5={current_ma5:.4f}%）")
+                        print(
+                            "市场形态：哑铃型（哑铃指数={:.4f}%，MA5={:.4f}%）".format(
+                                current_dumbbell, current_ma5))
                     # 向下突破5日均线：当前值<MA5 且 前值>=前MA5
                     elif current_dumbbell < current_ma5 and prev_dumbbell >= prev_ma5:
                         indicators['market_pattern'] = '纺锤型'
                         indicators['pattern_signal'] = -1  # 向下突破
-                        print(f"市场形态：纺锤型（哑铃指数={current_dumbbell:.4f}%，MA5={current_ma5:.4f}%）")
+                        print(
+                            "市场形态：纺锤型（哑铃指数={:.4f}%，MA5={:.4f}%）".format(
+                                current_dumbbell, current_ma5))
                     else:
                         indicators['market_pattern'] = '无形态变化'
                         indicators['pattern_signal'] = 0  # 无变化
-                        print(f"市场形态：无形态变化（哑铃指数={current_dumbbell:.4f}%，MA5={current_ma5:.4f}%）")
+                        print(
+                            "市场形态：无形态变化（哑铃指数={:.4f}%，MA5={:.4f}%）".format(
+                                current_dumbbell, current_ma5))
                 else:
-                    print(f"市场形态指标：数据不足，合并后只有{len(df_merged)}天，需要至少6天")
+                    print("市场形态指标：数据不足，合并后只有{}天，需要至少6天".format(len(df_merged)))
         except Exception as e:
             print(f"计算市场形态指标失败: {e}")
         

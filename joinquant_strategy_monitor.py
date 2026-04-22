@@ -11,6 +11,37 @@ from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 # 聚宽数据API导入
 from jqdata import *
 
+
+def get_weekly_observation_end_date(run_dt=None):
+    """周度监测：数据截止日 = 严格早于运行日的「最近一个自然周五」对应的最近 A 股交易日（不晚于该周五）。"""
+    if run_dt is None:
+        run_dt = dt.datetime.now()
+    cal = run_dt.date()
+    target_friday = None
+    for i in range(1, 21):
+        c = cal - dt.timedelta(days=i)
+        if c.weekday() == 4:
+            target_friday = c
+            break
+    if target_friday is None:
+        target_friday = cal - dt.timedelta(days=7)
+    target_s = target_friday.strftime('%Y-%m-%d')
+    try:
+        start_s = (target_friday - dt.timedelta(days=45)).strftime('%Y-%m-%d')
+        try:
+            tds = get_trade_days(start_date=start_s, end_date=target_s)
+        except TypeError:
+            tds = get_trade_days(end_date=target_s, count=30)
+        if tds is not None and len(tds) > 0:
+            last = tds[-1]
+            if hasattr(last, 'strftime'):
+                return str(last)[:10]
+            return pd.Timestamp(last).strftime('%Y-%m-%d')
+    except Exception:
+        pass
+    return target_s
+
+
 # ============================================
 # 数据获取模块 - 使用聚宽API
 # ============================================
@@ -18,13 +49,20 @@ from jqdata import *
 class DataFetcher:
     """数据获取类 - 聚宽版本"""
     
-    def __init__(self):
-        pass
+    def __init__(self, observation_end_date=None):
+        """observation_end_date: 'YYYY-MM-DD'，为 None 时用运行当日（兼容旧行为）。"""
+        self.observation_end_date = observation_end_date
+    
+    def _end(self, end_date):
+        if end_date is not None:
+            return end_date
+        if self.observation_end_date:
+            return self.observation_end_date
+        return dt.datetime.now().strftime('%Y-%m-%d')
     
     def get_index_daily(self, symbol, period=120, end_date=None):
         """获取指数日线数据"""
-        if end_date is None:
-            end_date = dt.datetime.now().strftime('%Y-%m-%d')
+        end_date = self._end(end_date)
         
         try:
             df = get_price(symbol, count=period, end_date=end_date, frequency='daily', fields=['open', 'close', 'high', 'low', 'volume', 'money'])
@@ -41,8 +79,7 @@ class DataFetcher:
     
     def get_etf_daily(self, symbol, period=252, end_date=None):
         """获取ETF日线数据"""
-        if end_date is None:
-            end_date = dt.datetime.now().strftime('%Y-%m-%d')
+        end_date = self._end(end_date)
         
         try:
             df = get_price(symbol, count=period, end_date=end_date, frequency='daily', fields=['open', 'close', 'high', 'low', 'volume', 'money'])
@@ -59,8 +96,7 @@ class DataFetcher:
     
     def get_etf_nav(self, symbol, period=252, end_date=None):
         """获取ETF单位净值数据 - 使用聚宽get_extras接口"""
-        if end_date is None:
-            end_date = dt.datetime.now().strftime('%Y-%m-%d')
+        end_date = self._end(end_date)
         
         try:
             start_date = (dt.datetime.strptime(end_date, '%Y-%m-%d') - dt.timedelta(days=period)).strftime('%Y-%m-%d')
@@ -77,12 +113,15 @@ class DataFetcher:
             print(f"获取ETF净值数据失败 {symbol}: {e}")
             return None
     
-    def get_futures_main_contract(self, underlying_symbol, period=252):
+    def get_futures_main_contract(self, underlying_symbol, period=252, end_date=None):
         """获取期货主力合约数据"""
         try:
-            dominant = get_dominant_future(underlying_symbol)
+            ed = self._end(end_date)
+            try:
+                dominant = get_dominant_future(underlying_symbol, ed)
+            except TypeError:
+                dominant = get_dominant_future(underlying_symbol)
             if dominant:
-                ed = dt.datetime.now().strftime('%Y-%m-%d')
                 df = get_price(dominant, count=period, end_date=ed, frequency='daily', fields=['open', 'close', 'high', 'low', 'volume', 'money'])
                 if df is not None and not df.empty:
                     df = df.reset_index()
@@ -99,11 +138,16 @@ class DataFetcher:
     def get_futures_info_data(self, underlying_symbol):
         """获取期货合约信息和持仓量"""
         try:
-            dominant = get_dominant_future(underlying_symbol)
+            ed = self._end(None)
+            try:
+                dominant = get_dominant_future(underlying_symbol, ed)
+            except TypeError:
+                dominant = get_dominant_future(underlying_symbol)
             if dominant:
+                end_dt = dt.datetime.strptime(ed, '%Y-%m-%d')
                 df = get_extras('futures_positions', [dominant], 
-                               start_date=(dt.datetime.now() - dt.timedelta(days=252)).strftime('%Y-%m-%d'),
-                               end_date=dt.datetime.now().strftime('%Y-%m-%d'))
+                               start_date=(end_dt - dt.timedelta(days=252)).strftime('%Y-%m-%d'),
+                               end_date=ed)
                 return df
             return None
         except Exception as e:
@@ -118,8 +162,9 @@ class DataFetcher:
 class IndicatorCalculator:
     """指标计算类"""
     
-    def __init__(self):
-        self.fetcher = DataFetcher()
+    def __init__(self, observation_end_date=None):
+        self.observation_end_date = observation_end_date
+        self.fetcher = DataFetcher(observation_end_date)
     
     def calculate_percentile_with_days(self, series, window=252, min_days=20):
         """计算历史分位数，并返回实际使用的天数
@@ -202,10 +247,13 @@ class IndicatorCalculator:
         for name, code in index_codes.items():
             try:
                 # 获取当前日期
-                end_date = dt.datetime.now().strftime('%Y-%m-%d')
+                end_date = self.fetcher._end(None)
                 
                 # 获取指数成分股
-                stocks = get_index_stocks(code)
+                try:
+                    stocks = get_index_stocks(code, date=end_date)
+                except TypeError:
+                    stocks = get_index_stocks(code)
                 
                 if stocks and len(stocks) > 0:
                     # 使用get_fundamentals获取成分股估值数据
@@ -271,10 +319,13 @@ class IndicatorCalculator:
         indicators = {}
         
         try:
-            end_date = dt.datetime.now().strftime('%Y-%m-%d')
+            end_date = self.fetcher._end(None)
             
             # 获取中证全指成分股作为全A代表
-            stocks = get_index_stocks('000985.XSHG')
+            try:
+                stocks = get_index_stocks('000985.XSHG', date=end_date)
+            except TypeError:
+                stocks = get_index_stocks('000985.XSHG')
             if not stocks or len(stocks) == 0:
                 print("获取中证全指成分股失败")
                 return indicators
@@ -617,7 +668,7 @@ class IndicatorCalculator:
         def get_option_iv(underlying_code, option_type='ETF', name=''):
             """获取期权的隐含波动率 - 扩大扫描范围"""
             try:
-                end_date = dt.datetime.now().strftime('%Y-%m-%d')
+                end_date = self.fetcher._end(None)
                 
                 # 使用更大的扫描范围
                 if option_type == 'ETF':
@@ -911,8 +962,8 @@ class IndicatorCalculator:
 class StrategyScorer:
     """策略评分：以各指标在自身历史分布中的分位数为主，线性映射到加减分（不依赖 SCORE_WEIGHTS 占位）。"""
     
-    def __init__(self):
-        self.calculator = IndicatorCalculator()
+    def __init__(self, observation_end_date=None):
+        self.calculator = IndicatorCalculator(observation_end_date)
 
     @staticmethod
     def _clamp_score(s):
@@ -1214,11 +1265,13 @@ class StrategyScorer:
 class ExcelReportGenerator:
     """Excel报告生成类"""
     
-    def __init__(self, output_path=None):
+    def __init__(self, output_path=None, observation_end_date=None, run_time_str=None):
+        self.observation_end_date = observation_end_date
+        self.run_time_str = run_time_str or dt.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
         if output_path is None:
             timestamp = dt.datetime.now().strftime('%Y%m%d_%H%M%S')
             # 聚宽环境中使用当前目录
-            self.output_path = f'strategy_monitor_report_{timestamp}.xlsx'
+            self.output_path = f'strategy_monitor_weekly_{timestamp}.xlsx'
         else:
             self.output_path = output_path
     
@@ -1245,12 +1298,13 @@ class ExcelReportGenerator:
         """创建总览sheet"""
         ws = wb.create_sheet("策略评分总览", 0)
         
-        ws['A1'] = '策略环境监测报告'
+        ws['A1'] = '策略环境监测报告（周度）'
         ws['A1'].font = Font(bold=True, size=16, color='1F4E78')
         ws.merge_cells('A1:E1')
         ws['A1'].alignment = Alignment(horizontal='center', vertical='center')
         
-        ws['A2'] = f'生成时间: {dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")}'
+        obs = self.observation_end_date or ''
+        ws['A2'] = '观测数据截止: {}  |  报告生成: {}'.format(obs, self.run_time_str)
         ws['A2'].font = Font(size=10, color='666666')
         ws.merge_cells('A2:E2')
         
@@ -2230,14 +2284,14 @@ class ExcelReportGenerator:
 # 主程序 - 聚宽研究环境入口
 # ============================================
 
-def collect_all_indicators():
-    """收集所有策略的指标"""
+def collect_all_indicators(observation_end_date=None):
+    """收集所有策略的指标；observation_end_date 为数据截止日（周度监测用上个周五对齐交易日）。"""
     print("=" * 60)
     print("正在收集各策略指标...")
     print("=" * 60)
     
-    calculator = IndicatorCalculator()
-    all_indicators = {}
+    calculator = IndicatorCalculator(observation_end_date)
+    all_indicators = {'_meta': {'observation_end_date': observation_end_date or ''}}
     
     # 1. 主观多头指标
     print("\n[1/7] 收集主观多头指标...")
@@ -2290,13 +2344,13 @@ def collect_all_indicators():
     return all_indicators
 
 
-def calculate_all_scores():
+def calculate_all_scores(observation_end_date=None):
     """计算所有策略评分"""
     print("\n" + "=" * 60)
     print("正在计算策略评分...")
     print("=" * 60)
     
-    scorer = StrategyScorer()
+    scorer = StrategyScorer(observation_end_date)
     all_scores = scorer.get_all_scores()
     
     for strategy_name, result in all_scores.items():
@@ -2309,6 +2363,10 @@ def calculate_all_scores():
 
 def generate_report(all_scores, all_indicators):
     """生成控制台报告"""
+    meta = all_indicators.get('_meta') or {}
+    obs = meta.get('observation_end_date')
+    if obs:
+        print("\n观测数据截止日: {}".format(obs))
     print("\n" + "=" * 60)
     print("策略评分总览")
     print("=" * 60)
@@ -2322,23 +2380,33 @@ def generate_report(all_scores, all_indicators):
 # 聚宽研究环境入口函数
 # ============================================
 
-def run_strategy_monitor(output_excel=True, excel_path=None):
+def run_strategy_monitor(output_excel=True, excel_path=None, observation_end_date=None, weekly=True):
     """
-    策略环境监测主函数
+    策略环境监测主函数（默认周度：数据截止到「上个自然周五」对齐的交易日）
     :param output_excel: 是否输出Excel报告
     :param excel_path: Excel文件保存路径，默认自动生成
+    :param observation_end_date: 数据截止日 YYYY-MM-DD；None 且 weekly=True 时自动取上周观测日
+    :param weekly: True 使用周度截止日；False 用 observation_end_date 或当日
     :return: (all_scores, all_indicators, excel_path)
     """
+    run_ts = dt.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    if weekly and observation_end_date is None:
+        observation_end_date = get_weekly_observation_end_date()
+    elif not weekly and observation_end_date is None:
+        observation_end_date = dt.datetime.now().strftime('%Y-%m-%d')
+    
     print("\n" + "=" * 60)
-    print("策略环境监测系统")
-    print(f"运行时间: {dt.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print("策略环境监测系统（周度监测）" if weekly else "策略环境监测系统")
+    print("运行时间: {}".format(run_ts))
+    if observation_end_date:
+        print("观测数据截止日（行情/截面）: {}".format(observation_end_date))
     print("=" * 60)
     
     # 1. 收集所有指标
-    all_indicators = collect_all_indicators()
+    all_indicators = collect_all_indicators(observation_end_date)
     
     # 2. 计算所有策略评分
-    all_scores = calculate_all_scores()
+    all_scores = calculate_all_scores(observation_end_date)
     
     # 3. 生成控制台报告
     generate_report(all_scores, all_indicators)
@@ -2349,7 +2417,10 @@ def run_strategy_monitor(output_excel=True, excel_path=None):
         print("\n" + "=" * 60)
         print("正在生成Excel报告...")
         print("=" * 60)
-        generator = ExcelReportGenerator(output_path=excel_path)
+        generator = ExcelReportGenerator(
+            output_path=excel_path,
+            observation_end_date=observation_end_date,
+            run_time_str=run_ts)
         excel_file_path = generator.generate_excel_report(all_scores, all_indicators)
     
     print("\n" + "=" * 60)

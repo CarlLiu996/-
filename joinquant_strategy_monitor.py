@@ -11,6 +11,104 @@ from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 # 聚宽数据API导入
 from jqdata import *
 
+
+def get_weekly_observation_end_date(run_dt=None):
+    """周度监测：数据截止日 = 严格早于运行日的「最近一个自然周五」对应的最近 A 股交易日（不晚于该周五）。"""
+    if run_dt is None:
+        run_dt = dt.datetime.now()
+    cal = run_dt.date()
+    target_friday = None
+    for i in range(1, 21):
+        c = cal - dt.timedelta(days=i)
+        if c.weekday() == 4:
+            target_friday = c
+            break
+    if target_friday is None:
+        target_friday = cal - dt.timedelta(days=7)
+    target_s = target_friday.strftime('%Y-%m-%d')
+    try:
+        start_s = (target_friday - dt.timedelta(days=45)).strftime('%Y-%m-%d')
+        try:
+            tds = get_trade_days(start_date=start_s, end_date=target_s)
+        except TypeError:
+            tds = get_trade_days(end_date=target_s, count=30)
+        if tds is not None and len(tds) > 0:
+            last = tds[-1]
+            if hasattr(last, 'strftime'):
+                return str(last)[:10]
+            return pd.Timestamp(last).strftime('%Y-%m-%d')
+    except Exception:
+        pass
+    return target_s
+
+
+def _resample_ohlcv_to_weekly_friday(df, date_col='日期'):
+    """日线 DataFrame → 周线（周五收盘），成交量/额取周内合计。"""
+    if df is None or df.empty or date_col not in df.columns:
+        return None
+    d = df.sort_values(date_col).copy()
+    d[date_col] = pd.to_datetime(d[date_col])
+    d = d.set_index(date_col)
+    agg = {}
+    if '开盘' in d.columns:
+        agg['开盘'] = 'first'
+    if '收盘' in d.columns:
+        agg['收盘'] = 'last'
+    if '最高' in d.columns:
+        agg['最高'] = 'max'
+    if '最低' in d.columns:
+        agg['最低'] = 'min'
+    if '成交量' in d.columns:
+        agg['成交量'] = 'sum'
+    if '成交额' in d.columns:
+        agg['成交额'] = 'sum'
+    if '持仓量' in d.columns:
+        agg['持仓量'] = 'sum'
+    if not agg:
+        return None
+    w = d.resample('W-FRI').agg(agg).dropna(how='all')
+    if w.empty:
+        return None
+    out = w.reset_index()
+    if out.columns[0] != date_col:
+        out = out.rename(columns={out.columns[0]: date_col})
+    return out
+
+
+def _resample_futures_daily_to_weekly(df, date_col='日期'):
+    """期货主力日线（开盘价/收盘价…）→ 周线。"""
+    if df is None or df.empty or date_col not in df.columns:
+        return None
+    rename_close = '收盘价' in df.columns
+    d = df.sort_values(date_col).copy()
+    d[date_col] = pd.to_datetime(d[date_col])
+    d = d.set_index(date_col)
+    agg = {}
+    if '开盘价' in d.columns:
+        agg['开盘价'] = 'first'
+    if '收盘价' in d.columns:
+        agg['收盘价'] = 'last'
+    if '最高价' in d.columns:
+        agg['最高价'] = 'max'
+    if '最低价' in d.columns:
+        agg['最低价'] = 'min'
+    if '成交量' in d.columns:
+        agg['成交量'] = 'sum'
+    if '成交额' in d.columns:
+        agg['成交额'] = 'sum'
+    if not agg:
+        return None
+    w = d.resample('W-FRI').agg(agg).dropna(how='all')
+    if w.empty:
+        return None
+    out = w.reset_index()
+    if out.columns[0] != date_col:
+        out = out.rename(columns={out.columns[0]: date_col})
+    if rename_close and '最新价' not in out.columns and '收盘价' in out.columns:
+        out['最新价'] = out['收盘价']
+    return out
+
+
 # ============================================
 # 数据获取模块 - 使用聚宽API
 # ============================================
@@ -18,17 +116,23 @@ from jqdata import *
 class DataFetcher:
     """数据获取类 - 聚宽版本"""
     
-    def __init__(self):
-        pass
+    def __init__(self, observation_end_date=None):
+        """observation_end_date: 'YYYY-MM-DD'，为 None 时用运行当日（兼容旧行为）。"""
+        self.observation_end_date = observation_end_date
+    
+    def _end(self, end_date):
+        if end_date is not None:
+            return end_date
+        if self.observation_end_date:
+            return self.observation_end_date
+        return dt.datetime.now().strftime('%Y-%m-%d')
     
     def get_index_daily(self, symbol, period=120, end_date=None):
         """获取指数日线数据"""
-        if end_date is None:
-            end_date = dt.datetime.now().strftime('%Y-%m-%d')
+        end_date = self._end(end_date)
         
         try:
-            df = get_price(symbol, count=period, end_date=end_date, frequency='daily', 
-                          fields=['open', 'close', 'high', 'low', 'volume', 'money'])
+            df = get_price(symbol, count=period, end_date=end_date, frequency='daily', fields=['open', 'close', 'high', 'low', 'volume', 'money'])
             if df is not None and not df.empty:
                 df = df.reset_index()
                 df.rename(columns={'index': '日期', 'open': '开盘', 'close': '收盘', 
@@ -42,12 +146,10 @@ class DataFetcher:
     
     def get_etf_daily(self, symbol, period=252, end_date=None):
         """获取ETF日线数据"""
-        if end_date is None:
-            end_date = dt.datetime.now().strftime('%Y-%m-%d')
+        end_date = self._end(end_date)
         
         try:
-            df = get_price(symbol, count=period, end_date=end_date, frequency='daily',
-                          fields=['open', 'close', 'high', 'low', 'volume', 'money'])
+            df = get_price(symbol, count=period, end_date=end_date, frequency='daily', fields=['open', 'close', 'high', 'low', 'volume', 'money'])
             if df is not None and not df.empty:
                 df = df.reset_index()
                 df.rename(columns={'index': '日期', 'open': '开盘', 'close': '收盘',
@@ -61,8 +163,7 @@ class DataFetcher:
     
     def get_etf_nav(self, symbol, period=252, end_date=None):
         """获取ETF单位净值数据 - 使用聚宽get_extras接口"""
-        if end_date is None:
-            end_date = dt.datetime.now().strftime('%Y-%m-%d')
+        end_date = self._end(end_date)
         
         try:
             start_date = (dt.datetime.strptime(end_date, '%Y-%m-%d') - dt.timedelta(days=period)).strftime('%Y-%m-%d')
@@ -79,17 +180,21 @@ class DataFetcher:
             print(f"获取ETF净值数据失败 {symbol}: {e}")
             return None
     
-    def get_futures_main_contract(self, underlying_symbol, period=252):
+    def get_futures_main_contract(self, underlying_symbol, period=252, end_date=None):
         """获取期货主力合约数据"""
         try:
-            dominant = get_dominant_future(underlying_symbol)
+            ed = self._end(end_date)
+            try:
+                dominant = get_dominant_future(underlying_symbol, ed)
+            except TypeError:
+                dominant = get_dominant_future(underlying_symbol)
             if dominant:
-                df = get_price(dominant, count=period, end_date=dt.datetime.now().strftime('%Y-%m-%d'),
-                              frequency='daily', fields=['open', 'close', 'high', 'low', 'volume'])
+                df = get_price(dominant, count=period, end_date=ed, frequency='daily', fields=['open', 'close', 'high', 'low', 'volume', 'money'])
                 if df is not None and not df.empty:
                     df = df.reset_index()
                     df.rename(columns={'index': '日期', 'open': '开盘价', 'close': '收盘价',
-                                      'high': '最高价', 'low': '最低价', 'volume': '成交量'}, inplace=True)
+                                      'high': '最高价', 'low': '最低价', 'volume': '成交量',
+                                      'money': '成交额'}, inplace=True)
                     df['最新价'] = df['收盘价']
                 return df
             return None
@@ -97,19 +202,141 @@ class DataFetcher:
             print(f"获取期货主力合约失败 {underlying_symbol}: {e}")
             return None
     
+    def get_index_weekly(self, symbol, approx_weeks=140, end_date=None):
+        """指数周线（周五），由日线重采样。"""
+        daily_count = max(300, approx_weeks * 7 + 80)
+        df = self.get_index_daily(symbol, period=daily_count, end_date=end_date)
+        return _resample_ohlcv_to_weekly_friday(df)
+
+    def get_etf_weekly(self, symbol, approx_weeks=140, end_date=None):
+        daily_count = max(300, approx_weeks * 7 + 80)
+        df = self.get_etf_daily(symbol, period=daily_count, end_date=end_date)
+        return _resample_ohlcv_to_weekly_friday(df)
+
+    def get_futures_main_weekly(self, underlying_symbol, approx_weeks=140, end_date=None):
+        daily_count = max(400, approx_weeks * 7 + 80)
+        df = self.get_futures_main_contract(underlying_symbol, period=daily_count, end_date=end_date)
+        return _resample_futures_daily_to_weekly(df)
+
     def get_futures_info_data(self, underlying_symbol):
         """获取期货合约信息和持仓量"""
         try:
-            dominant = get_dominant_future(underlying_symbol)
+            ed = self._end(None)
+            try:
+                dominant = get_dominant_future(underlying_symbol, ed)
+            except TypeError:
+                dominant = get_dominant_future(underlying_symbol)
             if dominant:
+                end_dt = dt.datetime.strptime(ed, '%Y-%m-%d')
                 df = get_extras('futures_positions', [dominant], 
-                               start_date=(dt.datetime.now() - dt.timedelta(days=252)).strftime('%Y-%m-%d'),
-                               end_date=dt.datetime.now().strftime('%Y-%m-%d'))
+                               start_date=(end_dt - dt.timedelta(days=252)).strftime('%Y-%m-%d'),
+                               end_date=ed)
                 return df
             return None
         except Exception as e:
             print(f"获取期货持仓量失败 {underlying_symbol}: {e}")
             return None
+
+    def get_commodity_equal_weight_main_daily(self, period=600, end_date=None):
+        """非中金所商品期货：各品种主力合约收盘价归一化后等权合成指数，成交量/持仓为各品种合计。"""
+
+        def _underlying_from_code(sec_code):
+            base = str(sec_code).split('.')[0]
+            letters = []
+            for ch in base:
+                if ch.isalpha():
+                    letters.append(ch)
+                else:
+                    break
+            return ''.join(letters).upper() if letters else None
+
+        ed = self._end(end_date)
+        try:
+            try:
+                all_f = get_all_securities(types=['futures'], date=ed)
+            except TypeError:
+                all_f = get_all_securities(['futures'])
+        except Exception as e:
+            print(f"获取期货列表失败: {e}")
+            return None
+        if all_f is None or all_f.empty:
+            return None
+
+        under_set = set()
+        for code in all_f.index:
+            sc = str(code)
+            if sc.endswith('.CCFX'):
+                continue
+            u = _underlying_from_code(sc)
+            if u:
+                under_set.add(u)
+        underlyings = sorted(under_set)
+
+        closes, vols, ois = {}, {}, {}
+        for u in underlyings:
+            try:
+                try:
+                    main = get_dominant_future(u, ed)
+                except TypeError:
+                    main = get_dominant_future(u)
+                if not main:
+                    continue
+                try:
+                    df = get_price(
+                        main, count=period, end_date=ed, frequency='daily',
+                        fields=['close', 'volume', 'open_interest'])
+                except Exception:
+                    df = get_price(
+                        main, count=period, end_date=ed, frequency='daily',
+                        fields=['close', 'volume'])
+                if df is None or df.empty:
+                    continue
+                df = df.reset_index()
+                tcol = 'index' if 'index' in df.columns else df.columns[0]
+                df.rename(columns={tcol: '日期', 'close': '收盘', 'volume': '成交量'}, inplace=True)
+                if 'open_interest' in df.columns:
+                    df.rename(columns={'open_interest': '持仓量'}, inplace=True)
+                df['日期'] = pd.to_datetime(df['日期'])
+                df = df.sort_values('日期').dropna(subset=['收盘'])
+                if len(df) < 10:
+                    continue
+                s_close = df.set_index('日期')['收盘'].astype(float)
+                first = float(s_close.dropna().iloc[0])
+                if first <= 0:
+                    continue
+                closes[u] = s_close / first * 100.0
+                vols[u] = df.set_index('日期')['成交量'].astype(float)
+                if '持仓量' in df.columns:
+                    ois[u] = df.set_index('日期')['持仓量'].astype(float)
+            except Exception:
+                continue
+
+        if not closes:
+            print("商品主力等权合成: 无有效品种数据")
+            return None
+
+        panel_c = pd.DataFrame(closes).sort_index().ffill()
+        for col in list(panel_c.columns):
+            if panel_c[col].dropna().empty:
+                panel_c = panel_c.drop(columns=[col])
+        if panel_c.empty:
+            return None
+        eq_close = panel_c.mean(axis=1, skipna=True)
+        sum_vol = pd.DataFrame(vols).sort_index().fillna(0).sum(axis=1)
+        sum_oi = None
+        if ois:
+            sum_oi = pd.DataFrame(ois).sort_index().fillna(0).sum(axis=1)
+        out = pd.DataFrame({
+            '日期': eq_close.index,
+            '收盘': eq_close.values,
+            '开盘': eq_close.values,
+            '最高': eq_close.values,
+            '最低': eq_close.values,
+            '成交量': sum_vol.reindex(eq_close.index).fillna(0).values,
+            '成交额': 0.0,
+            '持仓量': sum_oi.reindex(eq_close.index).fillna(0).values if sum_oi is not None else 0.0,
+        })
+        return out.dropna(subset=['收盘'])
 
 
 # ============================================
@@ -119,8 +346,17 @@ class DataFetcher:
 class IndicatorCalculator:
     """指标计算类"""
     
-    def __init__(self):
-        self.fetcher = DataFetcher()
+    def __init__(self, observation_end_date=None, weekly=False):
+        self.observation_end_date = observation_end_date
+        self.weekly = weekly
+        self.fetcher = DataFetcher(observation_end_date)
+
+    def _pct_window(self):
+        return (52, 10) if self.weekly else (252, 20)
+
+    def percentile_series(self, series):
+        w, m = self._pct_window()
+        return self.calculate_percentile_with_days(series, window=w, min_days=m)
     
     def calculate_percentile_with_days(self, series, window=252, min_days=20):
         """计算历史分位数，并返回实际使用的天数
@@ -150,41 +386,58 @@ class IndicatorCalculator:
     # ==================== 主观多头指标 ====================
     
     def get_sentiment_indicators(self):
-        """获取市场情绪指标"""
+        """获取市场情绪指标（日度或周度）"""
         indicators = {}
         
-        # 0. 主要指数当日涨跌幅
         index_returns_map = {
             '沪深300': '000300.XSHG',
             '中证A500': '000510.XSHG',
             '中证500': '000905.XSHG',
             '中证1000': '000852.XSHG',
-            '国证2000': '399303.XSHE',  # 小盘股指数
+            '国证2000': '399303.XSHE',
         }
         
-        for name, code in index_returns_map.items():
+        if self.weekly:
+            for name, code in index_returns_map.items():
+                try:
+                    wdf = self.fetcher.get_index_weekly(code, approx_weeks=6)
+                    if wdf is not None and not wdf.empty and len(wdf) >= 2:
+                        wdf = wdf.sort_values('日期')
+                        w_ret = (wdf['收盘'].iloc[-1] / wdf['收盘'].iloc[-2] - 1) * 100
+                        indicators[f'{name}_daily_return'] = round(w_ret, 2)
+                except Exception as e:
+                    print(f"获取{name}周涨跌幅失败: {e}")
             try:
-                df = self.fetcher.get_index_daily(code, period=2)
-                if df is not None and not df.empty and len(df) >= 2:
-                    df = df.sort_values('日期')
-                    daily_return = (df['收盘'].iloc[-1] / df['收盘'].iloc[-2] - 1) * 100
-                    indicators[f'{name}_daily_return'] = round(daily_return, 2)
+                widx = self.fetcher.get_index_weekly("000001.XSHG", approx_weeks=30)
+                if widx is not None and not widx.empty:
+                    widx = widx.sort_values('日期')
+                    last_amt = widx['成交额'].iloc[-1] / 1e8
+                    indicators['market_amount_20d_avg'] = round(last_amt, 2)
+                    if len(widx) >= 5:
+                        ch = (widx['成交额'].iloc[-1] / widx['成交额'].iloc[-5] - 1) * 100
+                        indicators['market_amount_change_20d'] = round(ch, 2)
             except Exception as e:
-                print(f"获取{name}当日涨跌幅失败: {e}")
-        
-        # 1. 交投活跃度 - 全市场成交额（以上证指数代理）
-        try:
-            df_index = self.fetcher.get_index_daily("000001.XSHG", period=40)
-            if df_index is not None and not df_index.empty:
-                df_index = df_index.sort_values('日期')
-                avg_amount_20 = df_index['成交额'].tail(20).mean() / 1e8
-                indicators['market_amount_20d_avg'] = round(avg_amount_20, 2)
-                
-                # 成交额变化率
-                amount_change = (df_index['成交额'].iloc[-1] / df_index['成交额'].iloc[-20] - 1) * 100
-                indicators['market_amount_change_20d'] = round(amount_change, 2)
-        except Exception as e:
-            print(f"计算市场成交额失败: {e}")
+                print(f"计算周度市场成交额失败: {e}")
+        else:
+            for name, code in index_returns_map.items():
+                try:
+                    df = self.fetcher.get_index_daily(code, period=2)
+                    if df is not None and not df.empty and len(df) >= 2:
+                        df = df.sort_values('日期')
+                        daily_return = (df['收盘'].iloc[-1] / df['收盘'].iloc[-2] - 1) * 100
+                        indicators[f'{name}_daily_return'] = round(daily_return, 2)
+                except Exception as e:
+                    print(f"获取{name}当日涨跌幅失败: {e}")
+            try:
+                df_index = self.fetcher.get_index_daily("000001.XSHG", period=40)
+                if df_index is not None and not df_index.empty:
+                    df_index = df_index.sort_values('日期')
+                    avg_amount_20 = df_index['成交额'].tail(20).mean() / 1e8
+                    indicators['market_amount_20d_avg'] = round(avg_amount_20, 2)
+                    amount_change = (df_index['成交额'].iloc[-1] / df_index['成交额'].iloc[-20] - 1) * 100
+                    indicators['market_amount_change_20d'] = round(amount_change, 2)
+            except Exception as e:
+                print(f"计算市场成交额失败: {e}")
         
         return indicators
     
@@ -203,10 +456,13 @@ class IndicatorCalculator:
         for name, code in index_codes.items():
             try:
                 # 获取当前日期
-                end_date = dt.datetime.now().strftime('%Y-%m-%d')
+                end_date = self.fetcher._end(None)
                 
                 # 获取指数成分股
-                stocks = get_index_stocks(code)
+                try:
+                    stocks = get_index_stocks(code, date=end_date)
+                except TypeError:
+                    stocks = get_index_stocks(code)
                 
                 if stocks and len(stocks) > 0:
                     # 使用get_fundamentals获取成分股估值数据
@@ -242,27 +498,25 @@ class IndicatorCalculator:
                             total_net_assets = (df_val['market_cap'] / df_val['pb_ratio']).sum()
                             index_pb = total_market_cap / total_net_assets
                             indicators[f'{name}_PB'] = round(index_pb, 2)
-                            
-                            # 获取历史PE/PB用于计算分位数（简化处理：使用指数价格分位数作为代理）
-                            df_index = self.fetcher.get_index_daily(code, period=252)
-                            if df_index is not None and not df_index.empty:
-                                current_price = df_index['收盘'].iloc[-1]
-                                price_percentile = (df_index['收盘'] < current_price).mean() * 100
-                                # 用价格分位数作为估值分位数的代理（价格越低估值越低）
-                                indicators[f'{name}_PE_percentile'] = round(100 - price_percentile, 2)
-                                indicators[f'{name}_PE_percentile_days'] = len(df_index)
-                                indicators[f'{name}_PB_percentile'] = round(100 - price_percentile, 2)
-                                indicators[f'{name}_PB_percentile_days'] = len(df_index)
                         
             except Exception as e:
                 print(f"获取{name}估值数据失败: {e}")
         
-        # 成长/价值比价
+        # 成长/价值比价（日度：近20交易日；周度：近5周）
         try:
-            df_cy = self.fetcher.get_index_daily("399006.XSHE", period=20)
-            df_hs300 = self.fetcher.get_index_daily("000300.XSHG", period=20)
-            
+            if self.weekly:
+                df_cy = self.fetcher.get_index_weekly("399006.XSHE", approx_weeks=8)
+                df_hs300 = self.fetcher.get_index_weekly("000300.XSHG", approx_weeks=8)
+            else:
+                df_cy = self.fetcher.get_index_daily("399006.XSHE", period=20)
+                df_hs300 = self.fetcher.get_index_daily("000300.XSHG", period=20)
             if df_cy is not None and df_hs300 is not None:
+                df_cy = df_cy.sort_values('日期')
+                df_hs300 = df_hs300.sort_values('日期')
+                if self.weekly:
+                    n = min(5, len(df_cy), len(df_hs300))
+                    df_cy = df_cy.tail(n)
+                    df_hs300 = df_hs300.tail(n)
                 cy_return = (df_cy['收盘'].iloc[-1] / df_cy['收盘'].iloc[0] - 1) * 100
                 hs300_return = (df_hs300['收盘'].iloc[-1] / df_hs300['收盘'].iloc[0] - 1) * 100
                 indicators['growth_value_ratio'] = round(cy_return - hs300_return, 2)
@@ -283,10 +537,13 @@ class IndicatorCalculator:
         indicators = {}
         
         try:
-            end_date = dt.datetime.now().strftime('%Y-%m-%d')
+            end_date = self.fetcher._end(None)
             
             # 获取中证全指成分股作为全A代表
-            stocks = get_index_stocks('000985.XSHG')
+            try:
+                stocks = get_index_stocks('000985.XSHG', date=end_date)
+            except TypeError:
+                stocks = get_index_stocks('000985.XSHG')
             if not stocks or len(stocks) == 0:
                 print("获取中证全指成分股失败")
                 return indicators
@@ -311,14 +568,8 @@ class IndicatorCalculator:
             if len(valid_stocks) == 0:
                 return indicators
             
-            # 获取近252+1个交易日的收盘价用于计算历史分位数
-            # +1是因为计算日收益率需要前一天的数据
-            history_period = 253
-            df_prices = get_price(
-                valid_stocks, count=history_period,
-                end_date=end_date, frequency='daily',
-                fields=['close'], panel=False
-            )
+            history_period = 380 if self.weekly else 253
+            df_prices = get_price(valid_stocks, count=history_period, end_date=end_date, frequency='daily', fields=['close'], panel=False)
             
             if df_prices is None or df_prices.empty:
                 print("获取个股价格数据失败")
@@ -328,7 +579,8 @@ class IndicatorCalculator:
             price_matrix = df_prices.pivot(index='time', columns='code', values='close')
             price_matrix = price_matrix.sort_index()
             
-            # 计算日收益率
+            if self.weekly:
+                price_matrix = price_matrix.resample('W-FRI').last().dropna(how='all')
             returns_matrix = price_matrix.pct_change().dropna(how='all')
             
             if returns_matrix.empty:
@@ -349,78 +601,24 @@ class IndicatorCalculator:
             # 分化度 = 市值加权 - 等权（正值表示大盘股跑赢多数个股）
             divergence_series = (cap_weighted_returns - equal_weighted_returns) * 100
             
-            # --- 当日分化度 ---
             latest_divergence = divergence_series.iloc[-1]
             indicators['market_divergence_daily'] = round(latest_divergence, 4)
             
-            # --- 近20日累计分化度（滚动求和） ---
-            if len(divergence_series) >= 20:
-                divergence_20d = divergence_series.tail(20).sum()
+            cum_n = 12 if self.weekly else 20
+            if len(divergence_series) >= cum_n:
+                divergence_20d = divergence_series.tail(cum_n).sum()
                 indicators['market_divergence_20d'] = round(divergence_20d, 4)
             
-            # --- 分化度的历史分位数（用20日累计分化度的滚动窗口） ---
-            if len(divergence_series) >= 40:
-                rolling_20d = divergence_series.rolling(window=20).sum().dropna()
-                percentile, days = self.calculate_percentile_with_days(rolling_20d, window=252, min_days=20)
+            min_hist = cum_n * 2 if self.weekly else 40
+            if len(divergence_series) >= min_hist:
+                roll_win = 12 if self.weekly else 20
+                rolling_div = divergence_series.rolling(window=roll_win).sum().dropna()
+                percentile, days = self.percentile_series(rolling_div)
                 if percentile is not None:
                     indicators['market_divergence_percentile'] = percentile
                     indicators['market_divergence_percentile_days'] = days
             
-            # --- 一九行情指数（0-100综合评分） ---
-            yijiu_score = 50  # 基准分50，中性状态
-            
-            # 维度1：当日分化度（权重30%）
-            # 阈值：日分化度 > 0.05% 为轻度一九，> 0.15% 为明显一九
-            if latest_divergence > 0.15:
-                yijiu_score += 15
-            elif latest_divergence > 0.05:
-                yijiu_score += 8
-            elif latest_divergence < -0.15:
-                yijiu_score -= 15
-            elif latest_divergence < -0.05:
-                yijiu_score -= 8
-            
-            # 维度2：20日累计分化度（权重40%）
-            divergence_20d = indicators.get('market_divergence_20d', 0)
-            if divergence_20d > 2.0:
-                yijiu_score += 20
-            elif divergence_20d > 1.0:
-                yijiu_score += 12
-            elif divergence_20d > 0.3:
-                yijiu_score += 5
-            elif divergence_20d < -2.0:
-                yijiu_score -= 20
-            elif divergence_20d < -1.0:
-                yijiu_score -= 12
-            elif divergence_20d < -0.3:
-                yijiu_score -= 5
-            
-            # 维度3：历史分位数（权重30%）
-            pct = indicators.get('market_divergence_percentile')
-            if pct is not None:
-                if pct > 80:
-                    yijiu_score += 15
-                elif pct > 60:
-                    yijiu_score += 8
-                elif pct < 20:
-                    yijiu_score -= 15
-                elif pct < 40:
-                    yijiu_score -= 8
-            
-            yijiu_score = max(0, min(100, yijiu_score))
-            indicators['yijiu_index'] = yijiu_score
-            
-            # 生成文字描述
-            if yijiu_score >= 75:
-                indicators['yijiu_level'] = '强一九行情'
-            elif yijiu_score >= 60:
-                indicators['yijiu_level'] = '偏一九行情'
-            elif yijiu_score >= 40:
-                indicators['yijiu_level'] = '市场均衡'
-            elif yijiu_score >= 25:
-                indicators['yijiu_level'] = '偏九一行情'
-            else:
-                indicators['yijiu_level'] = '强九一行情'
+            # 不再内置「一九指数」主观阈值打分；仅输出分化度序列，评分侧用其历史分位
             
         except Exception as e:
             print(f"计算一九行情指标失败: {e}")
@@ -433,10 +631,17 @@ class IndicatorCalculator:
         
         # 1. 交投活跃度
         try:
-            df_index = self.fetcher.get_index_daily("000001.XSHG", period=40)
-            if df_index is not None and not df_index.empty:
-                avg_amount_20 = df_index['成交额'].tail(20).mean() / 1e8
-                indicators['market_amount_20d_avg'] = round(avg_amount_20, 2)
+            if self.weekly:
+                df_index = self.fetcher.get_index_weekly("000001.XSHG", approx_weeks=30)
+                if df_index is not None and not df_index.empty:
+                    df_index = df_index.sort_values('日期')
+                    avg_amount = df_index['成交额'].tail(4).mean() / 1e8
+                    indicators['market_amount_20d_avg'] = round(avg_amount, 2)
+            else:
+                df_index = self.fetcher.get_index_daily("000001.XSHG", period=40)
+                if df_index is not None and not df_index.empty:
+                    avg_amount_20 = df_index['成交额'].tail(20).mean() / 1e8
+                    indicators['market_amount_20d_avg'] = round(avg_amount_20, 2)
         except Exception as e:
             print(f"计算市场成交额失败: {e}")
         
@@ -448,17 +653,24 @@ class IndicatorCalculator:
         }
         
         try:
-            # 获取中证全指成交额（包含沪深两市全部A股）
-            df_all = self.fetcher.get_index_daily("000985.XSHG", period=20)  # 中证全指
-            
-            if df_all is not None and not df_all.empty:
-                total_amount = df_all['成交额'].sum()
-                
-                for name, code in index_symbols.items():
-                    df_idx = self.fetcher.get_index_daily(code, period=20)
-                    if df_idx is not None and not df_idx.empty:
-                        idx_amount = df_idx['成交额'].sum()
-                        indicators[f'{name}_crowding'] = round(idx_amount / total_amount * 100, 2)
+            if self.weekly:
+                df_all = self.fetcher.get_index_weekly("000985.XSHG", approx_weeks=8)
+                if df_all is not None and not df_all.empty:
+                    total_amount = df_all['成交额'].sum()
+                    for name, code in index_symbols.items():
+                        df_idx = self.fetcher.get_index_weekly(code, approx_weeks=8)
+                        if df_idx is not None and not df_idx.empty:
+                            idx_amount = df_idx['成交额'].sum()
+                            indicators[f'{name}_crowding'] = round(idx_amount / total_amount * 100, 2)
+            else:
+                df_all = self.fetcher.get_index_daily("000985.XSHG", period=20)
+                if df_all is not None and not df_all.empty:
+                    total_amount = df_all['成交额'].sum()
+                    for name, code in index_symbols.items():
+                        df_idx = self.fetcher.get_index_daily(code, period=20)
+                        if df_idx is not None and not df_idx.empty:
+                            idx_amount = df_idx['成交额'].sum()
+                            indicators[f'{name}_crowding'] = round(idx_amount / total_amount * 100, 2)
         except Exception as e:
             print(f"计算拥挤度失败: {e}")
         
@@ -474,95 +686,57 @@ class IndicatorCalculator:
     # ==================== CTA策略指标（仅商品期货） ====================
     
     def get_cta_indicators(self):
-        """获取CTA策略指标 - 仅商品期货"""
+        """CTA：商品主力等权合成指数 — 年化波动、周均成交、价格水平及其历史分位。"""
         indicators = {}
-        
-        # 商品期货品种列表（含黄金）
-        commodity_symbols = ['RB', 'CU', 'SC', 'M', 'I', 'AU']  # AU=黄金
-        
-        # 1. 商品期货波动率及分位数
         try:
-            volatilities = []
-            for symbol in commodity_symbols:
-                try:
-                    df = self.fetcher.get_futures_main_contract(symbol, period=252)
-                    if df is not None and not df.empty and len(df) >= 20:
-                        df = df.sort_values('日期')
-                        df['daily_return'] = df['收盘价'].pct_change()
-                        
-                        # 计算20日滚动波动率序列
-                        df['volatility_20d'] = df['daily_return'].rolling(20).std() * np.sqrt(252) * 100
-                        
-                        # 当前波动率
-                        current_vol = df['volatility_20d'].iloc[-1]
-                        if not np.isnan(current_vol):
-                            indicators[f'{symbol}_volatility_20d'] = round(current_vol, 2)
-                            volatilities.append(current_vol)
-                        
-                        # 波动率近一年分位数（记录实际天数）
-                        vol_percentile, vol_days = self.calculate_percentile_with_days(df['volatility_20d'], window=252, min_days=20)
-                        if vol_percentile is not None:
-                            indicators[f'{symbol}_volatility_percentile'] = vol_percentile
-                            indicators[f'{symbol}_volatility_percentile_days'] = vol_days
-                except:
-                    continue
-            
-            if volatilities:
-                indicators['commodity_avg_volatility'] = round(np.mean(volatilities), 2)
+            daily = self.fetcher.get_commodity_equal_weight_main_daily(period=800)
+            if daily is None or daily.empty:
+                print("CTA: 商品主力等权合成数据不足")
+                return indicators
+            daily = daily.sort_values('日期')
+            if self.weekly:
+                df = _resample_ohlcv_to_weekly_friday(daily)
+            else:
+                df = daily
+            if df is None or df.empty or len(df) < 30:
+                print("CTA: 重采样后数据不足")
+                return indicators
+            df = df.sort_values('日期')
+            ret = df['收盘'].pct_change()
+            win = 4 if self.weekly else 20
+            ann = 52 if self.weekly else 252
+            vol_s = ret.rolling(win).std() * np.sqrt(ann) * 100
+            cur_vol = vol_s.iloc[-1]
+            if not np.isnan(cur_vol):
+                indicators['commodity_eq_volatility'] = round(float(cur_vol), 2)
+            vp, vd = self.percentile_series(vol_s.dropna())
+            if vp is not None:
+                indicators['commodity_eq_volatility_percentile'] = vp
+                indicators['commodity_eq_volatility_percentile_days'] = vd
+            avg_vol = df['成交量'].tail(win).mean()
+            if not np.isnan(avg_vol):
+                indicators['commodity_eq_avg_volume'] = round(float(avg_vol), 2)
+            ap, ad = self.percentile_series(df['成交量'])
+            if ap is not None:
+                indicators['commodity_eq_volume_percentile'] = ap
+                indicators['commodity_eq_volume_percentile_days'] = ad
+            lvl = df['收盘'].iloc[-1]
+            if not np.isnan(lvl):
+                indicators['commodity_eq_price_level'] = round(float(lvl), 4)
+            pp, pd_ = self.percentile_series(df['收盘'])
+            if pp is not None:
+                indicators['commodity_eq_price_percentile'] = pp
+                indicators['commodity_eq_price_percentile_days'] = pd_
+            if '持仓量' in df.columns:
+                oi = df['持仓量'].iloc[-1]
+                if not np.isnan(oi):
+                    indicators['commodity_eq_open_interest'] = round(float(oi), 2)
+                op, od = self.percentile_series(df['持仓量'])
+                if op is not None:
+                    indicators['commodity_eq_oi_percentile'] = op
+                    indicators['commodity_eq_oi_percentile_days'] = od
         except Exception as e:
-            print(f"计算商品期货波动率失败: {e}")
-        
-        # 2. 商品期货成交量及分位数
-        try:
-            total_volumes = []
-            for symbol in commodity_symbols:
-                try:
-                    df = self.fetcher.get_futures_main_contract(symbol, period=252)
-                    if df is not None and not df.empty:
-                        # 近20日平均成交量
-                        avg_vol = df['成交量'].tail(20).mean()
-                        if not np.isnan(avg_vol):
-                            indicators[f'{symbol}_avg_volume'] = round(avg_vol, 2)
-                            total_volumes.append(avg_vol)
-                        
-                        # 成交量近一年分位数（记录实际天数）
-                        vol_percentile, vol_days = self.calculate_percentile_with_days(df['成交量'], window=252, min_days=20)
-                        if vol_percentile is not None:
-                            indicators[f'{symbol}_volume_percentile'] = vol_percentile
-                            indicators[f'{symbol}_volume_percentile_days'] = vol_days
-                except:
-                    continue
-            
-            if total_volumes:
-                indicators['commodity_total_volume'] = round(np.sum(total_volumes), 2)
-        except Exception as e:
-            print(f"计算商品期货成交量失败: {e}")
-        
-        # 3. 商品期货持仓量及分位数
-        try:
-            total_positions = 0
-            for symbol in commodity_symbols:
-                try:
-                    df_pos = self.fetcher.get_futures_info_data(symbol)
-                    if df_pos is not None and not df_pos.empty:
-                        # 最新持仓量
-                        latest_pos = df_pos.iloc[-1].values[0] if len(df_pos.columns) > 0 else 0
-                        indicators[f'{symbol}_positions'] = round(latest_pos, 2)
-                        total_positions += latest_pos
-                        
-                        # 持仓量近一年分位数（记录实际天数）
-                        pos_series = df_pos.iloc[:, 0] if len(df_pos.columns) > 0 else pd.Series()
-                        pos_percentile, pos_days = self.calculate_percentile_with_days(pos_series, window=252, min_days=20)
-                        if pos_percentile is not None:
-                            indicators[f'{symbol}_positions_percentile'] = pos_percentile
-                            indicators[f'{symbol}_positions_percentile_days'] = pos_days
-                except:
-                    continue
-            
-            indicators['commodity_total_positions'] = round(total_positions, 2)
-        except Exception as e:
-            print(f"计算商品期货持仓量失败: {e}")
-        
+            print(f"计算CTA商品等权指标失败: {e}")
         return indicators
     
     # ==================== 套利策略指标 ====================
@@ -594,53 +768,30 @@ class IndicatorCalculator:
         
         for etf_code, etf_name in etf_list.items():
             try:
-                # 获取ETF数据（近一年）
-                df_etf = self.fetcher.get_etf_daily(etf_code, period=252)
-                df_nav = self.fetcher.get_etf_nav(etf_code, period=252)
-                
-                if df_etf is not None and not df_etf.empty:
-                    # 1.1 ETF成交额及分位数（记录实际天数）
-                    avg_amount_20d = df_etf['成交额'].tail(20).mean() / 1e8
-                    indicators[f'{etf_name}_avg_amount_20d'] = round(avg_amount_20d, 2)
-                    
-                    amount_percentile, amount_days = self.calculate_percentile_with_days(df_etf['成交额'], window=252, min_days=20)
-                    if amount_percentile is not None:
-                        indicators[f'{etf_name}_amount_percentile'] = amount_percentile
-                        indicators[f'{etf_name}_amount_percentile_days'] = amount_days
-                    
-                    # 1.2 ETF波动率及分位数（记录实际天数）
-                    df_etf = df_etf.sort_values('日期')
-                    df_etf['daily_return'] = df_etf['收盘'].pct_change()
-                    df_etf['volatility_20d'] = df_etf['daily_return'].rolling(20).std() * np.sqrt(252) * 100
-                    
-                    current_vol = df_etf['volatility_20d'].iloc[-1]
-                    if not np.isnan(current_vol):
-                        indicators[f'{etf_name}_volatility_20d'] = round(current_vol, 2)
-                    
-                    vol_percentile, vol_days = self.calculate_percentile_with_days(df_etf['volatility_20d'], window=252, min_days=20)
-                    if vol_percentile is not None:
-                        indicators[f'{etf_name}_volatility_percentile'] = vol_percentile
-                        indicators[f'{etf_name}_volatility_percentile_days'] = vol_days
-                    
-                    # 1.3 ETF折溢价率及分位数 - 使用单位净值(NAV)计算
-                    if df_nav is not None and not df_nav.empty:
-                        # 合并ETF价格和净值数据
-                        df_premium = pd.merge(df_etf[['日期', '收盘']], df_nav[['日期', '单位净值']], 
-                                             on='日期', how='inner')
-                        
-                        if len(df_premium) > 0:
-                            # 计算折溢价率 = (收盘价 / 单位净值 - 1) * 100%
-                            df_premium['premium'] = (df_premium['收盘'] / df_premium['单位净值'] - 1) * 100
-                            
-                            # 当前折溢价率
-                            current_premium = df_premium['premium'].iloc[-1]
-                            indicators[f'{etf_name}_premium'] = round(current_premium, 4)
-                            
-                            # 折溢价率近一年分位数（记录实际天数）
-                            premium_percentile, premium_days = self.calculate_percentile_with_days(df_premium['premium'], window=252, min_days=20)
-                            if premium_percentile is not None:
-                                indicators[f'{etf_name}_premium_percentile'] = premium_percentile
-                                indicators[f'{etf_name}_premium_percentile_days'] = premium_days
+                if self.weekly:
+                    df_etf = self.fetcher.get_etf_weekly(etf_code, approx_weeks=140)
+                else:
+                    df_etf = self.fetcher.get_etf_daily(etf_code, period=252)
+                if df_etf is None or df_etf.empty:
+                    continue
+                win = 4 if self.weekly else 20
+                ann = 52 if self.weekly else 252
+                avg_amt = df_etf['成交额'].tail(win).mean() / 1e8
+                indicators[f'{etf_name}_avg_amount_20d'] = round(avg_amt, 2)
+                ap, ad = self.percentile_series(df_etf['成交额'])
+                if ap is not None:
+                    indicators[f'{etf_name}_amount_percentile'] = ap
+                    indicators[f'{etf_name}_amount_percentile_days'] = ad
+                df_etf = df_etf.sort_values('日期')
+                df_etf['daily_return'] = df_etf['收盘'].pct_change()
+                df_etf['volatility_20d'] = df_etf['daily_return'].rolling(win).std() * np.sqrt(ann) * 100
+                current_vol = df_etf['volatility_20d'].iloc[-1]
+                if not np.isnan(current_vol):
+                    indicators[f'{etf_name}_volatility_20d'] = round(float(current_vol), 2)
+                vp, vd = self.percentile_series(df_etf['volatility_20d'])
+                if vp is not None:
+                    indicators[f'{etf_name}_volatility_percentile'] = vp
+                    indicators[f'{etf_name}_volatility_percentile_days'] = vd
             except Exception as e:
                 print(f"计算{etf_name}指标失败: {e}")
         
@@ -654,31 +805,28 @@ class IndicatorCalculator:
         
         for future_code, index_name in futures_map.items():
             try:
-                df_future = self.fetcher.get_futures_main_contract(future_code, period=252)
-                if df_future is not None and not df_future.empty and len(df_future) >= 20:
+                if self.weekly:
+                    df_future = self.fetcher.get_futures_main_weekly(future_code, approx_weeks=140)
+                    win, ann, min_bars = 4, 52, 25
+                else:
+                    df_future = self.fetcher.get_futures_main_contract(future_code, period=252)
+                    win, ann, min_bars = 20, 252, 20
+                if df_future is not None and not df_future.empty and len(df_future) >= min_bars:
                     df_future = df_future.sort_values('日期')
                     df_future['daily_return'] = df_future['收盘价'].pct_change()
-                    
-                    # 计算20日滚动波动率序列
-                    df_future['volatility_20d'] = df_future['daily_return'].rolling(20).std() * np.sqrt(252) * 100
-                    
-                    # 当前波动率
+                    df_future['volatility_20d'] = df_future['daily_return'].rolling(win).std() * np.sqrt(ann) * 100
                     current_vol = df_future['volatility_20d'].iloc[-1]
                     if not np.isnan(current_vol):
-                        indicators[f'{future_code}_volatility_20d'] = round(current_vol, 2)
-                    
-                    # 波动率近一年分位数（记录实际天数）
-                    vol_percentile, vol_days = self.calculate_percentile_with_days(df_future['volatility_20d'], window=252, min_days=20)
+                        indicators[f'{future_code}_volatility_20d'] = round(float(current_vol), 2)
+                    vol_percentile, vol_days = self.percentile_series(df_future['volatility_20d'])
                     if vol_percentile is not None:
                         indicators[f'{future_code}_volatility_percentile'] = vol_percentile
                         indicators[f'{future_code}_volatility_percentile_days'] = vol_days
-                    
-                    # 成交额近一年分位数（记录实际天数）
-                    amount_percentile, amount_days = self.calculate_percentile_with_days(df_future['成交额'], window=252, min_days=20)
+                    amount_percentile, amount_days = self.percentile_series(df_future['成交额'])
                     if amount_percentile is not None:
                         indicators[f'{future_code}_amount_percentile'] = amount_percentile
                         indicators[f'{future_code}_amount_percentile_days'] = amount_days
-            except:
+            except Exception:
                 continue
         
         # ===== 3. 期权套利指标 =====
@@ -687,7 +835,10 @@ class IndicatorCalculator:
         def get_option_iv(underlying_code, option_type='ETF', name=''):
             """获取期权的隐含波动率 - 扩大扫描范围"""
             try:
-                end_date = dt.datetime.now().strftime('%Y-%m-%d')
+                end_date = self.fetcher._end(None)
+                wk = self.weekly
+                iv_count = 400 if wk else 252
+                iv_window, iv_min = ((52, 10) if wk else (252, 20))
                 
                 # 使用更大的扫描范围
                 if option_type == 'ETF':
@@ -704,8 +855,7 @@ class IndicatorCalculator:
                         for i in code_range:
                             try:
                                 code = f'{i}.XSHG'
-                                df = get_price(code, count=3, end_date=end_date, 
-                                              frequency='daily', fields=['close', 'implied_volatility'])
+                                df = get_price(code, count=3, end_date=end_date, frequency='daily', fields=['close', 'implied_volatility'])
                                 if df is not None and not df.empty:
                                     last_iv = df['implied_volatility'].iloc[-1]
                                     if pd.notna(last_iv) and last_iv > 0:
@@ -721,21 +871,22 @@ class IndicatorCalculator:
                         best_code = option_list[len(option_list)//2][0]
                         
                         # 获取该合约的历史IV
-                        df_option = get_price(best_code, count=252, end_date=end_date,
-                                             frequency='daily', fields=['close', 'implied_volatility'])
-                        if df_option is not None and not df.empty:
+                        df_option = get_price(best_code, count=iv_count, end_date=end_date, frequency='daily', fields=['close', 'implied_volatility'])
+                        if df_option is not None and not df_option.empty:
                             df_option = df_option.reset_index()
                             df_option.rename(columns={'index': '日期', 'implied_volatility': 'IV'}, inplace=True)
                             df_option['日期'] = pd.to_datetime(df_option['日期'])
                             df_option = df_option.sort_values('日期')
                             df_option = df_option.dropna(subset=['IV'])
-                            
-                            if len(df_option) >= 20:
+                            if wk:
+                                df_option = df_option.set_index('日期')['IV'].resample('W-FRI').last().dropna().reset_index()
+                                df_option.columns = ['日期', 'IV']
+                            if len(df_option) >= iv_min:
                                 current_iv = df_option['IV'].iloc[-1]
                                 indicators[f'{name}_IV'] = round(current_iv * 100, 2)
                                 
                                 iv_percentile, iv_days = self.calculate_percentile_with_days(
-                                    df_option['IV'], window=252, min_days=20)
+                                    df_option['IV'], window=iv_window, min_days=iv_min)
                                 if iv_percentile is not None:
                                     indicators[f'{name}_IV_percentile'] = iv_percentile
                                     indicators[f'{name}_IV_percentile_days'] = iv_days
@@ -753,8 +904,7 @@ class IndicatorCalculator:
                         for i in code_range:
                             try:
                                 code = f'{i}.XSHG'
-                                df = get_price(code, count=3, end_date=end_date,
-                                              frequency='daily', fields=['close', 'implied_volatility'])
+                                df = get_price(code, count=3, end_date=end_date, frequency='daily', fields=['close', 'implied_volatility'])
                                 if df is not None and not df.empty:
                                     last_iv = df['implied_volatility'].iloc[-1]
                                     if pd.notna(last_iv) and last_iv > 0:
@@ -768,21 +918,22 @@ class IndicatorCalculator:
                         option_list.sort(key=lambda x: x[1])
                         best_code = option_list[len(option_list)//2][0]
                         
-                        df_option = get_price(best_code, count=252, end_date=end_date,
-                                             frequency='daily', fields=['close', 'implied_volatility'])
-                        if df_option is not None and not df.empty:
+                        df_option = get_price(best_code, count=iv_count, end_date=end_date, frequency='daily', fields=['close', 'implied_volatility'])
+                        if df_option is not None and not df_option.empty:
                             df_option = df_option.reset_index()
                             df_option.rename(columns={'index': '日期', 'implied_volatility': 'IV'}, inplace=True)
                             df_option['日期'] = pd.to_datetime(df_option['日期'])
                             df_option = df_option.sort_values('日期')
                             df_option = df_option.dropna(subset=['IV'])
-                            
-                            if len(df_option) > 0:
+                            if wk:
+                                df_option = df_option.set_index('日期')['IV'].resample('W-FRI').last().dropna().reset_index()
+                                df_option.columns = ['日期', 'IV']
+                            if len(df_option) >= iv_min:
                                 current_iv = df_option['IV'].iloc[-1]
                                 indicators[f'{name}_IV'] = round(current_iv * 100, 2)
                                 
                                 iv_percentile, iv_days = self.calculate_percentile_with_days(
-                                    df_option['IV'], window=252, min_days=20)
+                                    df_option['IV'], window=iv_window, min_days=iv_min)
                                 if iv_percentile is not None:
                                     indicators[f'{name}_IV_percentile'] = iv_percentile
                                     indicators[f'{name}_IV_percentile_days'] = iv_days
@@ -814,8 +965,12 @@ class IndicatorCalculator:
         
         for future_code, index_code in futures_basis_map.items():
             try:
-                df_future = self.fetcher.get_futures_main_contract(future_code, period=5)
-                df_index = self.fetcher.get_index_daily(index_code, period=5)
+                if self.weekly:
+                    df_future = self.fetcher.get_futures_main_weekly(future_code, approx_weeks=8)
+                    df_index = self.fetcher.get_index_weekly(index_code, approx_weeks=8)
+                else:
+                    df_future = self.fetcher.get_futures_main_contract(future_code, period=5)
+                    df_index = self.fetcher.get_index_daily(index_code, period=5)
                 
                 if df_future is not None and df_index is not None:
                     future_price = df_future['收盘价'].iloc[-1]
@@ -834,15 +989,22 @@ class IndicatorCalculator:
     # ==================== 市场中性策略指标 ====================
     
     def get_market_neutral_indicators(self):
-        """获取市场中性策略指标"""
+        """获取市场中性策略指标（不含市场形态/哑铃类指标）。"""
         indicators = {}
         
         # 1. 交投活跃度
         try:
-            df_index = self.fetcher.get_index_daily("000001.XSHG", period=40)
-            if df_index is not None and not df_index.empty:
-                avg_amount_20 = df_index['成交额'].tail(20).mean() / 1e8
-                indicators['market_amount_20d_avg'] = round(avg_amount_20, 2)
+            if self.weekly:
+                df_index = self.fetcher.get_index_weekly("000001.XSHG", approx_weeks=30)
+                if df_index is not None and not df_index.empty:
+                    df_index = df_index.sort_values('日期')
+                    avg_amount = df_index['成交额'].tail(4).mean() / 1e8
+                    indicators['market_amount_20d_avg'] = round(avg_amount, 2)
+            else:
+                df_index = self.fetcher.get_index_daily("000001.XSHG", period=40)
+                if df_index is not None and not df_index.empty:
+                    avg_amount_20 = df_index['成交额'].tail(20).mean() / 1e8
+                    indicators['market_amount_20d_avg'] = round(avg_amount_20, 2)
         except Exception as e:
             print(f"计算市场成交额失败: {e}")
         
@@ -854,17 +1016,24 @@ class IndicatorCalculator:
         }
         
         try:
-            # 获取中证全指成交额（包含沪深两市全部A股）
-            df_all = self.fetcher.get_index_daily("000985.XSHG", period=20)  # 中证全指
-            
-            if df_all is not None and not df_all.empty:
-                total_amount = df_all['成交额'].sum()
-                
-                for name, code in index_symbols.items():
-                    df_idx = self.fetcher.get_index_daily(code, period=20)
-                    if df_idx is not None and not df_idx.empty:
-                        idx_amount = df_idx['成交额'].sum()
-                        indicators[f'{name}_crowding'] = round(idx_amount / total_amount * 100, 2)
+            if self.weekly:
+                df_all = self.fetcher.get_index_weekly("000985.XSHG", approx_weeks=8)
+                if df_all is not None and not df_all.empty:
+                    total_amount = df_all['成交额'].sum()
+                    for name, code in index_symbols.items():
+                        df_idx = self.fetcher.get_index_weekly(code, approx_weeks=8)
+                        if df_idx is not None and not df_idx.empty:
+                            idx_amount = df_idx['成交额'].sum()
+                            indicators[f'{name}_crowding'] = round(idx_amount / total_amount * 100, 2)
+            else:
+                df_all = self.fetcher.get_index_daily("000985.XSHG", period=20)
+                if df_all is not None and not df_all.empty:
+                    total_amount = df_all['成交额'].sum()
+                    for name, code in index_symbols.items():
+                        df_idx = self.fetcher.get_index_daily(code, period=20)
+                        if df_idx is not None and not df_idx.empty:
+                            idx_amount = df_idx['成交额'].sum()
+                            indicators[f'{name}_crowding'] = round(idx_amount / total_amount * 100, 2)
         except Exception as e:
             print(f"计算拥挤度失败: {e}")
         
@@ -877,8 +1046,12 @@ class IndicatorCalculator:
         
         for future_code, index_code in futures_map.items():
             try:
-                df_future = self.fetcher.get_futures_main_contract(future_code, period=5)
-                df_index = self.fetcher.get_index_daily(index_code, period=5)
+                if self.weekly:
+                    df_future = self.fetcher.get_futures_main_weekly(future_code, approx_weeks=8)
+                    df_index = self.fetcher.get_index_weekly(index_code, approx_weeks=8)
+                else:
+                    df_future = self.fetcher.get_futures_main_contract(future_code, period=5)
+                    df_index = self.fetcher.get_index_daily(index_code, period=5)
                 
                 if df_future is not None and df_index is not None:
                     future_price = df_future['收盘价'].iloc[-1]
@@ -891,84 +1064,6 @@ class IndicatorCalculator:
             except Exception as e:
                 print(f"计算{future_code}基差失败: {e}")
         
-        # 4. 市场形态指标（哑铃型/纺锤型）
-        try:
-            # 获取三个指数的日线数据（需要至少6天数据计算5日均线）
-            df_2000 = self.fetcher.get_index_daily("399303.XSHE", period=10)  # 国证2000
-            df_300 = self.fetcher.get_index_daily("000300.XSHG", period=10)   # 沪深300
-            df_500 = self.fetcher.get_index_daily("000905.XSHG", period=10)   # 中证500
-            
-            # 检查数据是否成功获取
-            if df_2000 is None:
-                print("获取国证2000数据失败，无法计算市场形态指标")
-            else:
-                print(f"国证2000数据量：{len(df_2000)}天")
-            if df_300 is None:
-                print("获取沪深300数据失败，无法计算市场形态指标")
-            else:
-                print(f"沪深300数据量：{len(df_300)}天")
-            if df_500 is None:
-                print("获取中证500数据失败，无法计算市场形态指标")
-            else:
-                print(f"中证500数据量：{len(df_500)}天")
-            
-            if df_2000 is not None and df_300 is not None and df_500 is not None:
-                # 设置日期为索引
-                df_2000 = df_2000.set_index('日期')
-                df_300 = df_300.set_index('日期')
-                df_500 = df_500.set_index('日期')
-                
-                # 计算日收益率
-                df_2000['return'] = df_2000['收盘'].pct_change() * 100
-                df_300['return'] = df_300['收盘'].pct_change() * 100
-                df_500['return'] = df_500['收盘'].pct_change() * 100
-                
-                # 合并数据（使用join确保日期对齐）
-                df_merged = pd.DataFrame({
-                    'r2000': df_2000['return'],
-                    'r300': df_300['return'],
-                    'r500': df_500['return']
-                }).dropna()
-                
-                print(f"市场形态指标：合并后数据量={len(df_merged)}天")
-                
-                if len(df_merged) >= 6:
-                    # 计算哑铃指数 = 国证2000 + 沪深300 - 中证500
-                    df_merged['dumbbell'] = df_merged['r2000'] + df_merged['r300'] - df_merged['r500']
-                    
-                    # 计算5日均线
-                    df_merged['ma5'] = df_merged['dumbbell'].rolling(5).mean()
-                    
-                    # 获取当前值和5日均线值
-                    current_dumbbell = df_merged['dumbbell'].iloc[-1]
-                    current_ma5 = df_merged['ma5'].iloc[-1]
-                    prev_dumbbell = df_merged['dumbbell'].iloc[-2]
-                    prev_ma5 = df_merged['ma5'].iloc[-2]
-                    
-                    # 存储指标值
-                    indicators['dumbbell_index'] = round(current_dumbbell, 4)
-                    indicators['dumbbell_ma5'] = round(current_ma5, 4)
-                    
-                    # 判断形态变化
-                    # 向上突破5日均线：当前值>MA5 且 前值<=前MA5
-                    if current_dumbbell > current_ma5 and prev_dumbbell <= prev_ma5:
-                        indicators['market_pattern'] = '哑铃型'
-                        indicators['pattern_signal'] = 1  # 向上突破
-                        print(f"市场形态：哑铃型（哑铃指数={current_dumbbell:.4f}%，MA5={current_ma5:.4f}%）")
-                    # 向下突破5日均线：当前值<MA5 且 前值>=前MA5
-                    elif current_dumbbell < current_ma5 and prev_dumbbell >= prev_ma5:
-                        indicators['market_pattern'] = '纺锤型'
-                        indicators['pattern_signal'] = -1  # 向下突破
-                        print(f"市场形态：纺锤型（哑铃指数={current_dumbbell:.4f}%，MA5={current_ma5:.4f}%）")
-                    else:
-                        indicators['market_pattern'] = '无形态变化'
-                        indicators['pattern_signal'] = 0  # 无变化
-                        print(f"市场形态：无形态变化（哑铃指数={current_dumbbell:.4f}%，MA5={current_ma5:.4f}%）")
-                else:
-                    print(f"市场形态指标：数据不足，合并后只有{len(df_merged)}天，需要至少6天")
-        except Exception as e:
-            print(f"计算市场形态指标失败: {e}")
-        
         return indicators
 
 
@@ -977,618 +1072,322 @@ class IndicatorCalculator:
 # ============================================
 
 class StrategyScorer:
-    """策略评分类"""
+    """策略评分：以各指标在自身历史分布中的分位数为主，线性映射到加减分（不依赖 SCORE_WEIGHTS 占位）。"""
     
-    def __init__(self):
-        self.calculator = IndicatorCalculator()
-        
-        self.thresholds = {
-            'subjective': {
-                'market_amount': {'high': 10000, 'low': 6000},
-                'price_percentile': {'cheap': 30, 'expensive': 70},
-            },
-            'quant': {
-                'crowding': {'high': 20, 'low': 10},
-                'yijiu': {'strong_yijiu': 75, 'mild_yijiu': 60, 'balanced': 40, 'mild_jiuyi': 25},
-            },
-            'cta': {
-                'volatility': {'high': 25, 'low': 15},
-            },
-            'arbitrage': {
-                'basis': {'high': -0.5, 'low': -2},
-                'etf_volatility_percentile': {'high': 70, 'low': 30},
-            },
-            'neutral': {
-                'basis_annual': {'high': 4, 'low': 0},
-            }
-        }
-    
+    def __init__(self, observation_end_date=None, weekly=False):
+        self.calculator = IndicatorCalculator(observation_end_date, weekly=weekly)
+
+    @staticmethod
+    def _clamp_score(s):
+        return max(0, min(100, int(round(s))))
+
+    def _pct_contrib(self, pct, days, label, weight, details):
+        """分位数 P∈[0,100] 相对中位 50 线性贡献，权重为极端满分幅度。"""
+        if pct is None:
+            details.append(f"{label}: 历史分位数据不足")
+            return 0.0
+        c = (float(pct) - 50.0) / 50.0 * float(weight)
+        unit = "周" if self.calculator.weekly else "天"
+        dstr = f"{days}{unit}" if days else ""
+        details.append(f"{label} 历史分位{pct:.1f}% ({dstr}): {c:+.1f}")
+        return c
+
+    def _series_market_amount_20d_avg(self, count=300):
+        w = self.calculator.weekly
+        if w:
+            df = self.calculator.fetcher.get_index_weekly("000001.XSHG", approx_weeks=count // 5)
+            if df is None or df.empty or len(df) < 10:
+                return None
+            df = df.sort_values('日期')
+            return (df['成交额'].rolling(4).mean() / 1e8).dropna()
+        df = self.calculator.fetcher.get_index_daily("000001.XSHG", period=count)
+        if df is None or df.empty or len(df) < 40:
+            return None
+        df = df.sort_values('日期')
+        return (df['成交额'].rolling(20).mean() / 1e8).dropna()
+
+    def _series_amount_change_20d(self, count=300):
+        w = self.calculator.weekly
+        if w:
+            df = self.calculator.fetcher.get_index_weekly("000001.XSHG", approx_weeks=count // 5)
+            if df is None or df.empty or len(df) < 10:
+                return None
+            df = df.sort_values('日期')
+            a = df['成交额']
+            return ((a / a.shift(4) - 1.0) * 100.0).dropna()
+        df = self.calculator.fetcher.get_index_daily("000001.XSHG", period=count)
+        if df is None or df.empty or len(df) < 40:
+            return None
+        df = df.sort_values('日期')
+        a = df['成交额']
+        return ((a / a.shift(20) - 1.0) * 100.0).dropna()
+
+    def _series_growth_value_ratio(self, count=120):
+        w = self.calculator.weekly
+        if w:
+            df_cy = self.calculator.fetcher.get_index_weekly("399006.XSHE", approx_weeks=count)
+            df_hs = self.calculator.fetcher.get_index_weekly("000300.XSHG", approx_weeks=count)
+        else:
+            df_cy = self.calculator.fetcher.get_index_daily("399006.XSHE", period=count)
+            df_hs = self.calculator.fetcher.get_index_daily("000300.XSHG", period=count)
+        if df_cy is None or df_hs is None or df_cy.empty or df_hs.empty:
+            return None
+        df_cy = df_cy.sort_values('日期').set_index('日期')['收盘']
+        df_hs = df_hs.sort_values('日期').set_index('日期')['收盘']
+        m = pd.concat([df_cy, df_hs], axis=1, join='inner').dropna()
+        lag = 4 if w else 20
+        if len(m) < lag + 5:
+            return None
+        r_cy = m.iloc[:, 0].pct_change(lag) * 100.0
+        r_hs = m.iloc[:, 1].pct_change(lag) * 100.0
+        return (r_cy - r_hs).dropna()
+
+    def _series_crowding(self, index_code, count=300):
+        w = self.calculator.weekly
+        if w:
+            df_all = self.calculator.fetcher.get_index_weekly("000985.XSHG", approx_weeks=count // 5)
+            df_idx = self.calculator.fetcher.get_index_weekly(index_code, approx_weeks=count // 5)
+        else:
+            df_all = self.calculator.fetcher.get_index_daily("000985.XSHG", period=count)
+            df_idx = self.calculator.fetcher.get_index_daily(index_code, period=count)
+        if df_all is None or df_idx is None or df_all.empty or df_idx.empty:
+            return None
+        df_all = df_all.sort_values('日期').set_index('日期')['成交额']
+        df_idx = df_idx.sort_values('日期').set_index('日期')['成交额']
+        m = pd.concat([df_all, df_idx], axis=1, join='inner').dropna()
+        win = 4 if w else 20
+        if len(m) < win + 5:
+            return None
+        roll_a = m.iloc[:, 0].rolling(win).sum()
+        roll_i = m.iloc[:, 1].rolling(win).sum()
+        return (roll_i / roll_a * 100.0).dropna()
+
+    def _contrib_from_series(self, series, label, weight, details):
+        _, min_pts = self.calculator._pct_window()
+        if series is None or len(series) < min_pts:
+            details.append(f"{label}: 序列数据不足")
+            return 0.0
+        pct, days = self.calculator.percentile_series(series)
+        return self._pct_contrib(pct, days, label, weight, details)
+
     def score_subjective_long(self):
-        """主观多头策略评分 - 使用PE分位数估值"""
-        score = 50
-        details = []
-        
+        score, details = 50.0, []
         try:
-            sentiment = self.calculator.get_sentiment_indicators()
-            valuation = self.calculator.get_valuation_indicators()
-            
-            # 1. 成交额评分 (25%)
-            market_amount = sentiment.get('market_amount_20d_avg', 8000)
-            if market_amount > self.thresholds['subjective']['market_amount']['high']:
-                score += 12
-                details.append(f"成交活跃({market_amount:.0f}亿): +12")
-            elif market_amount < self.thresholds['subjective']['market_amount']['low']:
-                score -= 12
-                details.append(f"成交萎缩({market_amount:.0f}亿): -12")
-            else:
-                details.append(f"成交正常({market_amount:.0f}亿): 0")
-            
-            # 2. 估值评分 (35%) - 使用PE分位数
-            pe_pct = valuation.get('沪深300_PE_percentile')
-            pe_days = valuation.get('沪深300_PE_percentile_days', 0)
-            current_pe = valuation.get('沪深300_PE', 0)
-            
-            if pe_pct is not None:
-                if pe_pct < 30:
-                    score += 18
-                    details.append(f"PE估值偏低({current_pe:.1f}倍, 分位{pe_pct:.0f}%, {pe_days}天): +18")
-                elif pe_pct > 70:
-                    score -= 18
-                    details.append(f"PE估值偏高({current_pe:.1f}倍, 分位{pe_pct:.0f}%, {pe_days}天): -18")
-                else:
-                    details.append(f"PE估值适中({current_pe:.1f}倍, 分位{pe_pct:.0f}%, {pe_days}天): 0")
-            else:
-                details.append(f"PE估值数据不足({current_pe:.1f}倍): 0")
-            
-            # 3. 成长价值比价 (25%)
-            gv_ratio = valuation.get('growth_value_ratio', 0)
-            if gv_ratio > 2:
-                score += 10
-                details.append(f"成长风格强势(+{gv_ratio:.1f}%): +10")
-            elif gv_ratio < -2:
-                score -= 10
-                details.append(f"价值风格强势({gv_ratio:.1f}%): -10")
-            else:
-                details.append(f"风格均衡({gv_ratio:.1f}%): 0")
-            
-            # 4. 成交额变化 (15%)
-            amount_change = sentiment.get('market_amount_change_20d', 0)
-            if amount_change > 10:
-                score += 8
-                details.append(f"成交明显改善(+{amount_change:.1f}%): +8")
-            elif amount_change < -10:
-                score -= 8
-                details.append(f"成交明显萎缩({amount_change:.1f}%): -8")
-            else:
-                details.append(f"成交变化平稳({amount_change:.1f}%): 0")
-            
+            w = self.calculator.weekly
+            score += self._contrib_from_series(
+                self._series_market_amount_20d_avg(),
+                '上证周均成交额(亿元,4周)' if w else '上证20日均成交额(亿元)',
+                16, details)
+            score += self._contrib_from_series(
+                self._series_amount_change_20d(),
+                '上证成交额4周环比(%)' if w else '上证成交额20日环比(%)',
+                12, details)
+            score += self._contrib_from_series(
+                self._series_growth_value_ratio(),
+                '创业板相对沪深300(4周超额%)' if w else '创业板相对沪深300(20日超额%)',
+                12, details)
         except Exception as e:
             details.append(f"评分计算出错: {e}")
-        
-        score = max(0, min(100, score))
-        
-        return {
-            'score': score,
-            'details': details,
-            'level': self._get_level(score),
-            'trend': '→ 持平'
-        }
-    
+        return {'score': self._clamp_score(score), 'details': details, 'level': self._get_level(score), 'trend': '→ 持平'}
+
     def score_quant_long(self):
-        """量化多头策略评分"""
-        score = 50
-        details = []
-        
+        score, details = 50.0, []
         try:
-            quant_indicators = self.calculator.get_quant_indicators()
-            
-            # 市场活跃度 (20%)
-            market_amount = quant_indicators.get('market_amount_20d_avg', 8000)
-            if market_amount > 10000:
-                score += 10
-                details.append(f"成交活跃({market_amount:.0f}亿): +10")
-            elif market_amount < 6000:
-                score -= 10
-                details.append(f"成交萎缩({market_amount:.0f}亿): -10")
-            else:
-                details.append(f"成交正常({market_amount:.0f}亿): 0")
-            
-            # 拥挤度 (45%)
-            crowding_1000 = quant_indicators.get('中证1000_crowding', 15)
-            if crowding_1000 > self.thresholds['quant']['crowding']['high']:
-                score -= 15
-                details.append(f"小盘拥挤度高({crowding_1000:.1f}%): -15")
-            elif crowding_1000 < self.thresholds['quant']['crowding']['low']:
-                score += 15
-                details.append(f"小盘拥挤度低({crowding_1000:.1f}%): +15")
-            else:
-                details.append(f"小盘拥挤度正常({crowding_1000:.1f}%): 0")
-            
-            # 一九行情指数 (35%) - 强一九行情不利于量化多头策略
-            yijiu = quant_indicators.get('yijiu_index')
-            yijiu_level = quant_indicators.get('yijiu_level', '未知')
-            divergence_20d = quant_indicators.get('market_divergence_20d')
-            divergence_pct = quant_indicators.get('market_divergence_percentile')
-            
-            if yijiu is not None:
-                if yijiu >= 75:
-                    score -= 15
-                    pct_str = f", 分位{divergence_pct:.0f}%" if divergence_pct is not None else ""
-                    d20_str = f", 20日累计{divergence_20d:.2f}%" if divergence_20d is not None else ""
-                    details.append(f"一九行情指数({yijiu}分/{yijiu_level}{d20_str}{pct_str}): -15")
-                elif yijiu >= 60:
-                    score -= 8
-                    pct_str = f", 分位{divergence_pct:.0f}%" if divergence_pct is not None else ""
-                    d20_str = f", 20日累计{divergence_20d:.2f}%" if divergence_20d is not None else ""
-                    details.append(f"一九行情指数({yijiu}分/{yijiu_level}{d20_str}{pct_str}): -8")
-                elif yijiu <= 25:
-                    score += 10
-                    pct_str = f", 分位{divergence_pct:.0f}%" if divergence_pct is not None else ""
-                    d20_str = f", 20日累计{divergence_20d:.2f}%" if divergence_20d is not None else ""
-                    details.append(f"一九行情指数({yijiu}分/{yijiu_level}{d20_str}{pct_str}): +10")
-                elif yijiu <= 40:
-                    score += 5
-                    pct_str = f", 分位{divergence_pct:.0f}%" if divergence_pct is not None else ""
-                    d20_str = f", 20日累计{divergence_20d:.2f}%" if divergence_20d is not None else ""
-                    details.append(f"一九行情指数({yijiu}分/{yijiu_level}{d20_str}{pct_str}): +5")
-                else:
-                    pct_str = f", 分位{divergence_pct:.0f}%" if divergence_pct is not None else ""
-                    d20_str = f", 20日累计{divergence_20d:.2f}%" if divergence_20d is not None else ""
-                    details.append(f"一九行情指数({yijiu}分/{yijiu_level}{d20_str}{pct_str}): 0")
-            else:
-                details.append("一九行情指数数据不足: 0")
-            
+            q = self.calculator.get_quant_indicators()
+            w = self.calculator.weekly
+            score += self._contrib_from_series(
+                self._series_market_amount_20d_avg(),
+                '市场周均成交额(亿元,4周)' if w else '市场20日均成交额(亿元)',
+                12, details)
+            score += self._contrib_from_series(
+                self._series_crowding('000852.XSHG'),
+                '中证1000拥挤度(4周)' if w else '中证1000拥挤度(占全市场%)',
+                18, details)
+            div_pct = q.get('market_divergence_percentile')
+            div_days = q.get('market_divergence_percentile_days', 0)
+            score += self._pct_contrib(
+                div_pct, div_days,
+                '分化度(12周累计)历史分位' if w else '市值加权-等权分化度(20日累计)历史分位',
+                22, details)
         except Exception as e:
             details.append(f"评分计算出错: {e}")
-        
-        score = max(0, min(100, score))
-        
-        return {
-            'score': score,
-            'details': details,
-            'level': self._get_level(score),
-            'trend': '→ 持平'
-        }
-    
+        return {'score': self._clamp_score(score), 'details': details, 'level': self._get_level(score), 'trend': '→ 持平'}
+
     def score_cta(self):
-        """CTA策略评分 - 使用分位数打分"""
-        score = 50
-        details = []
-        
+        score, details = 50.0, []
         try:
-            cta_indicators = self.calculator.get_cta_indicators()
-            
-            # 1. 商品期货波动率分位数 (50%) - 使用分位数打分
-            vol_percentiles = []
-            vol_days_list = []
-            for symbol in ['RB', 'CU', 'SC', 'M', 'I', 'AU']:
-                pct = cta_indicators.get(f'{symbol}_volatility_percentile')
-                days = cta_indicators.get(f'{symbol}_volatility_percentile_days', 0)
-                if pct is not None:
-                    vol_percentiles.append(pct)
-                    vol_days_list.append(days)
-            
-            if vol_percentiles:
-                avg_vol_percentile = np.mean(vol_percentiles)
-                avg_days = int(np.mean(vol_days_list)) if vol_days_list else 0
-                
-                if avg_vol_percentile > 70:
-                    score += 20
-                    details.append(f"商品波动率分位高({avg_vol_percentile:.0f}%, {avg_days}天): +20")
-                elif avg_vol_percentile > 30:
-                    score += 10
-                    details.append(f"商品波动率分位适中({avg_vol_percentile:.0f}%, {avg_days}天): +10")
-                else:
-                    score -= 10
-                    details.append(f"商品波动率分位低({avg_vol_percentile:.0f}%, {avg_days}天): -10")
-            else:
-                details.append("商品波动率分位数据不足: 0")
-            
-            # 2. 商品期货成交量分位数 (25%) - 使用分位数打分
-            volume_percentiles = []
-            volume_days_list = []
-            for symbol in ['RB', 'CU', 'SC', 'M', 'I', 'AU']:
-                pct = cta_indicators.get(f'{symbol}_volume_percentile')
-                days = cta_indicators.get(f'{symbol}_volume_percentile_days', 0)
-                if pct is not None:
-                    volume_percentiles.append(pct)
-                    volume_days_list.append(days)
-            
-            if volume_percentiles:
-                avg_vol_pct = np.mean(volume_percentiles)
-                avg_days = int(np.mean(volume_days_list)) if volume_days_list else 0
-                
-                if avg_vol_pct > 70:
-                    score += 12
-                    details.append(f"商品成交量分位高({avg_vol_pct:.0f}%, {avg_days}天): +12")
-                elif avg_vol_pct > 30:
-                    score += 6
-                    details.append(f"商品成交量分位适中({avg_vol_pct:.0f}%, {avg_days}天): +6")
-                else:
-                    score -= 6
-                    details.append(f"商品成交量分位低({avg_vol_pct:.0f}%, {avg_days}天): -6")
-            else:
-                details.append("商品成交量分位数据不足: 0")
-            
-            # 3. 商品期货持仓量分位数 (25%) - 使用分位数打分
-            pos_percentiles = []
-            pos_days_list = []
-            for symbol in ['RB', 'CU', 'SC', 'M', 'I', 'AU']:
-                pct = cta_indicators.get(f'{symbol}_positions_percentile')
-                days = cta_indicators.get(f'{symbol}_positions_percentile_days', 0)
-                if pct is not None:
-                    pos_percentiles.append(pct)
-                    pos_days_list.append(days)
-            
-            if pos_percentiles:
-                avg_pos_pct = np.mean(pos_percentiles)
-                avg_days = int(np.mean(pos_days_list)) if pos_days_list else 0
-                
-                if avg_pos_pct > 70:
-                    score += 12
-                    details.append(f"商品持仓量分位高({avg_pos_pct:.0f}%, {avg_days}天): +12")
-                elif avg_pos_pct > 30:
-                    score += 6
-                    details.append(f"商品持仓量分位适中({avg_pos_pct:.0f}%, {avg_days}天): +6")
-                else:
-                    score -= 6
-                    details.append(f"商品持仓量分位低({avg_pos_pct:.0f}%, {avg_days}天): -6")
-            else:
-                details.append("商品持仓量分位数据不足: 0")
-            
+            c = self.calculator.get_cta_indicators()
+            w = self.calculator.weekly
+            lab_vol = '商品等权指数年化波动分位' + ('(4周)' if w else '(20日)')
+            lab_volm = '商品等权指数周均成交量分位' if w else '商品等权指数成交量分位'
+            lab_px = '商品等权指数价位分位'
+            vp, vd = c.get('commodity_eq_volatility_percentile'), c.get('commodity_eq_volatility_percentile_days')
+            score += self._pct_contrib(vp, vd, lab_vol, 22, details)
+            ap, ad = c.get('commodity_eq_volume_percentile'), c.get('commodity_eq_volume_percentile_days')
+            score += self._pct_contrib(ap, ad, lab_volm, 18, details)
+            pp, pd_ = c.get('commodity_eq_price_percentile'), c.get('commodity_eq_price_percentile_days')
+            score += self._pct_contrib(pp, pd_, lab_px, 18, details)
+            op, od = c.get('commodity_eq_oi_percentile'), c.get('commodity_eq_oi_percentile_days')
+            score += self._pct_contrib(op, od, '商品等权指数持仓量分位', 14, details)
         except Exception as e:
             details.append(f"评分计算出错: {e}")
-        
-        score = max(0, min(100, score))
-        
-        return {
-            'score': score,
-            'details': details,
-            'level': self._get_level(score),
-            'trend': '→ 持平'
-        }
-    
+        return {'score': self._clamp_score(score), 'details': details, 'level': self._get_level(score), 'trend': '→ 持平'}
+
     def score_etf_arbitrage(self):
-        """ETF套利策略评分 - 使用分位数打分"""
-        score = 50
-        details = []
-        
+        score, details = 50.0, []
         try:
-            arb_indicators = self.calculator.get_arbitrage_indicators()
-            
-            # 1. ETF波动率分位数 (35%) - 综合多个ETF
-            vol_percentiles = []
-            vol_days_list = []
-            for etf in ['300ETF', '500ETF', '1000ETF', '50ETF', '创业板ETF', '科创50ETF']:
-                pct = arb_indicators.get(f'{etf}_volatility_percentile')
-                days = arb_indicators.get(f'{etf}_volatility_percentile_days', 0)
-                if pct is not None:
-                    vol_percentiles.append(pct)
-                    vol_days_list.append(days)
-            
-            if vol_percentiles:
-                avg_vol_pct = np.mean(vol_percentiles)
-                avg_days = int(np.mean(vol_days_list)) if vol_days_list else 0
-                
-                if avg_vol_pct > 70:
-                    score += 15
-                    details.append(f"ETF波动率分位高({avg_vol_pct:.0f}%, {avg_days}天): +15")
-                elif avg_vol_pct < 30:
-                    score -= 10
-                    details.append(f"ETF波动率分位低({avg_vol_pct:.0f}%, {avg_days}天): -10")
-                else:
-                    details.append(f"ETF波动率分位适中({avg_vol_pct:.0f}%, {avg_days}天): 0")
+            a = self.calculator.get_arbitrage_indicators()
+            etfs = ['300ETF', '500ETF', '1000ETF', '50ETF', '创业板ETF', '科创50ETF']
+            vp, vd, ap, ad = [], [], [], []
+            w = self.calculator.weekly
+            for e in etfs:
+                p = a.get(f'{e}_volatility_percentile')
+                if p is not None:
+                    vp.append(p)
+                    vd.append(a.get(f'{e}_volatility_percentile_days', 0))
+                p = a.get(f'{e}_amount_percentile')
+                if p is not None:
+                    ap.append(p)
+                    ad.append(a.get(f'{e}_amount_percentile_days', 0))
+            if vp:
+                score += self._pct_contrib(
+                    float(np.mean(vp)), int(np.mean(vd)) if vd else 0,
+                    'ETF波动率分位(均值' + ('，周线)' if w else ')'),
+                    22, details)
             else:
-                details.append("ETF波动率分位数据不足: 0")
-            
-            # 2. ETF折溢价率分位数 (40%) - 使用分位数打分
-            premium_percentiles = []
-            premium_days_list = []
-            for etf in ['300ETF', '500ETF', '1000ETF', '50ETF', '创业板ETF', '科创50ETF']:
-                pct = arb_indicators.get(f'{etf}_premium_percentile')
-                days = arb_indicators.get(f'{etf}_premium_percentile_days', 0)
-                if pct is not None:
-                    premium_percentiles.append(pct)
-                    premium_days_list.append(days)
-            
-            if premium_percentiles:
-                avg_premium_pct = np.mean(premium_percentiles)
-                avg_days = int(np.mean(premium_days_list)) if premium_days_list else 0
-                
-                # 折溢价率分位数在30%-70%之间为正常，偏离越大机会越大
-                if avg_premium_pct > 80 or avg_premium_pct < 20:
-                    score += 18
-                    details.append(f"ETF折溢价分位极端({avg_premium_pct:.0f}%, {avg_days}天): +18")
-                elif avg_premium_pct > 70 or avg_premium_pct < 30:
-                    score += 10
-                    details.append(f"ETF折溢价分位偏离({avg_premium_pct:.0f}%, {avg_days}天): +10")
-                else:
-                    details.append(f"ETF折溢价分位正常({avg_premium_pct:.0f}%, {avg_days}天): 0")
+                details.append('ETF波动率分位: 数据不足')
+            if ap:
+                score += self._pct_contrib(
+                    float(np.mean(ap)), int(np.mean(ad)) if ad else 0,
+                    'ETF成交额分位(均值' + ('，周线)' if w else ')'),
+                    20, details)
             else:
-                details.append("ETF折溢价分位数据不足: 0")
-            
-            # 3. ETF成交额分位数 (25%) - 使用分位数打分
-            amount_percentiles = []
-            amount_days_list = []
-            for etf in ['300ETF', '500ETF', '1000ETF', '50ETF', '创业板ETF', '科创50ETF']:
-                pct = arb_indicators.get(f'{etf}_amount_percentile')
-                days = arb_indicators.get(f'{etf}_amount_percentile_days', 0)
-                if pct is not None:
-                    amount_percentiles.append(pct)
-                    amount_days_list.append(days)
-            
-            if amount_percentiles:
-                avg_amt_pct = np.mean(amount_percentiles)
-                avg_days = int(np.mean(amount_days_list)) if amount_days_list else 0
-                
-                if avg_amt_pct > 70:
-                    score += 10
-                    details.append(f"ETF成交额分位高({avg_amt_pct:.0f}%, {avg_days}天): +10")
-                elif avg_amt_pct < 30:
-                    score -= 5
-                    details.append(f"ETF成交额分位低({avg_amt_pct:.0f}%, {avg_days}天): -5")
-                else:
-                    details.append(f"ETF成交额分位正常({avg_amt_pct:.0f}%, {avg_days}天): 0")
-            else:
-                details.append("ETF成交额分位数据不足: 0")
-            
+                details.append('ETF成交额分位: 数据不足')
         except Exception as e:
             details.append(f"评分计算出错: {e}")
-        
-        score = max(0, min(100, score))
-        
-        return {
-            'score': score,
-            'details': details,
-            'level': self._get_level(score),
-            'trend': '→ 持平'
-        }
-    
+        return {'score': self._clamp_score(score), 'details': details, 'level': self._get_level(score), 'trend': '→ 持平'}
+
     def score_index_arbitrage(self):
-        """股指高频套利策略评分 - 使用分位数打分"""
-        score = 50
-        details = []
-        
+        score, details = 50.0, []
         try:
-            arb_indicators = self.calculator.get_arbitrage_indicators()
-            
-            # 1. 股指期货波动率分位数 (40%) - 使用分位数打分
-            vol_percentiles = []
-            vol_days_list = []
-            for future in ['IF', 'IC', 'IM']:
-                pct = arb_indicators.get(f'{future}_volatility_percentile')
-                days = arb_indicators.get(f'{future}_volatility_percentile_days', 0)
-                if pct is not None:
-                    vol_percentiles.append(pct)
-                    vol_days_list.append(days)
-            
-            if vol_percentiles:
-                avg_vol_pct = np.mean(vol_percentiles)
-                avg_days = int(np.mean(vol_days_list)) if vol_days_list else 0
-                
-                if avg_vol_pct > 70:
-                    score += 16
-                    details.append(f"股指波动率分位高({avg_vol_pct:.0f}%, {avg_days}天): +16")
-                elif avg_vol_pct > 30:
-                    score += 8
-                    details.append(f"股指波动率分位适中({avg_vol_pct:.0f}%, {avg_days}天): +8")
-                else:
-                    score -= 8
-                    details.append(f"股指波动率分位低({avg_vol_pct:.0f}%, {avg_days}天): -8")
+            a = self.calculator.get_arbitrage_indicators()
+            vp, vd, ap, ad = [], [], [], []
+            for f in ['IF', 'IC', 'IM']:
+                p = a.get(f'{f}_volatility_percentile')
+                if p is not None:
+                    vp.append(p)
+                    vd.append(a.get(f'{f}_volatility_percentile_days', 0))
+                p = a.get(f'{f}_amount_percentile')
+                if p is not None:
+                    ap.append(p)
+                    ad.append(a.get(f'{f}_amount_percentile_days', 0))
+            if vp:
+                score += self._pct_contrib(float(np.mean(vp)), int(np.mean(vd)) if vd else 0, '股指期货波动率分位(均值)', 22, details)
             else:
-                details.append("股指波动率分位数据不足: 0")
-            
-            # 2. 股指期货成交额分位数 (35%) - 使用分位数打分
-            amt_percentiles = []
-            amt_days_list = []
-            for future in ['IF', 'IC', 'IM']:
-                pct = arb_indicators.get(f'{future}_amount_percentile')
-                days = arb_indicators.get(f'{future}_amount_percentile_days', 0)
-                if pct is not None:
-                    amt_percentiles.append(pct)
-                    amt_days_list.append(days)
-            
-            if amt_percentiles:
-                avg_amt_pct = np.mean(amt_percentiles)
-                avg_days = int(np.mean(amt_days_list)) if amt_days_list else 0
-                
-                if avg_amt_pct > 70:
-                    score += 14
-                    details.append(f"股指成交额分位高({avg_amt_pct:.0f}%, {avg_days}天): +14")
-                elif avg_amt_pct > 30:
-                    score += 7
-                    details.append(f"股指成交额分位适中({avg_amt_pct:.0f}%, {avg_days}天): +7")
-                else:
-                    score -= 7
-                    details.append(f"股指成交额分位低({avg_amt_pct:.0f}%, {avg_days}天): -7")
+                details.append('股指期货波动率分位: 数据不足')
+            if ap:
+                score += self._pct_contrib(float(np.mean(ap)), int(np.mean(ad)) if ad else 0, '股指期货成交额分位(均值)', 18, details)
             else:
-                details.append("股指成交额分位数据不足: 0")
-            
-            # 3. 股指期货波动率绝对值参考 (25%) - 辅助判断
-            if_vol = arb_indicators.get('IF_volatility_20d')
-            ic_vol = arb_indicators.get('IC_volatility_20d')
-            im_vol = arb_indicators.get('IM_volatility_20d')
-            vols = [v for v in [if_vol, ic_vol, im_vol] if v is not None]
-            
-            if vols:
-                avg_vol = np.mean(vols)
-                if avg_vol > 25:
-                    score += 8
-                    details.append(f"股指波动率绝对值高({avg_vol:.1f}%): +8")
-                elif avg_vol < 10:
-                    score -= 5
-                    details.append(f"股指波动率绝对值低({avg_vol:.1f}%): -5")
-                else:
-                    details.append(f"股指波动率绝对值适中({avg_vol:.1f}%): 0")
-            else:
-                details.append("股指波动率绝对值数据不足: 0")
-            
+                details.append('股指期货成交额分位: 数据不足')
         except Exception as e:
             details.append(f"评分计算出错: {e}")
-        
-        score = max(0, min(100, score))
-        
-        return {
-            'score': score,
-            'details': details,
-            'level': self._get_level(score),
-            'trend': '→ 持平'
-        }
-    
+        return {'score': self._clamp_score(score), 'details': details, 'level': self._get_level(score), 'trend': '→ 持平'}
+
     def score_option_arbitrage(self):
-        """期权套利策略评分 - 使用分位数打分"""
-        score = 50
-        details = []
-        
+        score, details = 50.0, []
         try:
-            arb_indicators = self.calculator.get_arbitrage_indicators()
-            
-            # 收集所有可用的IV分位数和天数
-            iv_percentiles = []
-            iv_days_list = []
-            
-            # ETF期权IV分位数
-            etf_names = ['50ETF', '300ETF', '500ETF', '科创50ETF', '创业板ETF', '深300ETF']
-            for name in etf_names:
-                pct = arb_indicators.get(f'{name}_IV_percentile')
-                days = arb_indicators.get(f'{name}_IV_percentile_days', 0)
-                if pct is not None:
-                    iv_percentiles.append(pct)
-                    iv_days_list.append(days)
-            
-            # 股指期权IV分位数
-            index_names = ['300股指', '1000股指', '50股指']
-            for name in index_names:
-                pct = arb_indicators.get(f'{name}_IV_percentile')
-                days = arb_indicators.get(f'{name}_IV_percentile_days', 0)
-                if pct is not None:
-                    iv_percentiles.append(pct)
-                    iv_days_list.append(days)
-            
-            # 商品期权IV分位数
-            commodity_names = ['铜期权', '豆粕期权', '白糖期权', '棉花期权']
-            for name in commodity_names:
-                pct = arb_indicators.get(f'{name}_IV_percentile')
-                days = arb_indicators.get(f'{name}_IV_percentile_days', 0)
-                if pct is not None:
-                    iv_percentiles.append(pct)
-                    iv_days_list.append(days)
-            
-            # 1. 综合隐含波动率分位数 (60%) - 使用分位数打分
-            if len(iv_percentiles) > 0:
-                avg_iv_pct = np.mean(iv_percentiles)
-                avg_days = int(np.mean([d for d in iv_days_list if d > 0])) if any(d > 0 for d in iv_days_list) else 0
-                
-                if avg_iv_pct > 70:
-                    score += 25
-                    details.append(f"综合IV分位高({avg_iv_pct:.0f}%, {avg_days}天): +25")
-                elif avg_iv_pct > 30:
-                    score += 12
-                    details.append(f"综合IV分位适中({avg_iv_pct:.0f}%, {avg_days}天): +12")
-                else:
-                    score -= 12
-                    details.append(f"综合IV分位低({avg_iv_pct:.0f}%, {avg_days}天): -12")
+            a = self.calculator.get_arbitrage_indicators()
+            names = (['50ETF', '300ETF', '500ETF', '科创50ETF', '创业板ETF', '深300ETF']
+                     + ['300股指', '1000股指', '50股指'])
+            pcts, days = [], []
+            for n in names:
+                p = a.get(f'{n}_IV_percentile')
+                if p is not None:
+                    pcts.append(p)
+                    days.append(a.get(f'{n}_IV_percentile_days', 0))
+            if pcts:
+                w = self.calculator.weekly
+                score += self._pct_contrib(
+                    float(np.mean(pcts)), int(np.mean(days)) if days else 0,
+                    '期权IV分位(均值' + ('，周线)' if w else ')'),
+                    26, details)
+                if len(pcts) >= 2:
+                    diff = max(pcts) - min(pcts)
+                    bonus = min(14.0, diff / 50.0 * 14.0)
+                    score += bonus
+                    details.append(f"IV分位跨标的分化(极差{diff:.1f}%): +{bonus:.1f}")
             else:
-                details.append("IV分位数据缺失: 0")
-            
-            # 2. IV分化 (40%) - 使用分位数计算分化
-            if len(iv_percentiles) >= 2:
-                iv_diff = max(iv_percentiles) - min(iv_percentiles)
-                if iv_diff > 20:
-                    score += 15
-                    details.append(f"IV分位分化大({iv_diff:.0f}%): +15")
-                elif iv_diff > 10:
-                    score += 8
-                    details.append(f"IV分位分化适中({iv_diff:.0f}%): +8")
-                else:
-                    details.append(f"IV分位分化小({iv_diff:.0f}%): 0")
-            else:
-                details.append("IV分位分化数据不足: 0")
-            
+                details.append('期权IV分位: 数据不足')
         except Exception as e:
             details.append(f"评分计算出错: {e}")
-        
-        score = max(0, min(100, score))
-        
-        return {
-            'score': score,
-            'details': details,
-            'level': self._get_level(score),
-            'trend': '→ 持平'
-        }
-    
+        return {'score': self._clamp_score(score), 'details': details, 'level': self._get_level(score), 'trend': '→ 持平'}
+
     def score_market_neutral(self):
-        """市场中性策略评分 - 基差=(期货-现货)/现货，负为贴水需付成本，正为升水有收益"""
-        score = 50
-        details = []
-        
+        score, details = 50.0, []
         try:
-            neutral_indicators = self.calculator.get_market_neutral_indicators()
-            
-            # 股指期货基差 (60%) - 基差=(期货-现货)/现货
-            # 基差为负：贴水，做空期货需要支付成本（期货到期收敛到现货，做空亏钱）
-            # 基差为正：升水，做空期货可以获得收益（期货到期收敛到现货，做空赚钱）
-            ic_basis = neutral_indicators.get('IC_basis_annual', 0)
-            im_basis = neutral_indicators.get('IM_basis_annual', 0)
-            avg_basis = (ic_basis + im_basis) / 2 if ic_basis and im_basis else 0
-            
-            if avg_basis > 4:  # 深度升水，对冲收益高
-                score += 25
-                details.append(f"深度升水收益高(年化{avg_basis:.2f}%): +25")
-            elif avg_basis > 2:  # 轻度升水，有对冲收益
-                score += 15
-                details.append(f"轻度升水有收益(年化{avg_basis:.2f}%): +15")
-            elif avg_basis > 0:  # 接近平水，收益较低
-                score += 5
-                details.append(f"接近平水收益低(年化{avg_basis:.2f}%): +5")
-            elif avg_basis > -2:  # 轻度贴水，成本较低
-                score -= 10
-                details.append(f"轻度贴水成本较低(年化{avg_basis:.2f}%): -10")
-            elif avg_basis > -4:  # 中度贴水，成本较高
-                score -= 20
-                details.append(f"中度贴水成本较高(年化{avg_basis:.2f}%): -20")
-            else:  # 深度贴水，成本太高
-                score -= 30
-                details.append(f"深度贴水成本太高(年化{avg_basis:.2f}%): -30")
-            
-            # 拥挤度 (30%) - 使用分位数逻辑（拥挤度本身就是分位数概念）
-            crowding_500 = neutral_indicators.get('中证500_crowding', 15)
-            if crowding_500 > 20:  # 拥挤度高，分位高
-                score -= 12
-                details.append(f"中盘拥挤度高({crowding_500:.1f}%): -12")
-            elif crowding_500 < 10:  # 拥挤度低，分位低
-                score += 12
-                details.append(f"中盘拥挤度低({crowding_500:.1f}%): +12")
+            w = self.calculator.weekly
+            n = self.calculator.get_market_neutral_indicators()
+            score += self._contrib_from_series(
+                self._series_market_amount_20d_avg(),
+                '市场周均成交额(亿元,4周)' if w else '市场20日均成交额(亿元)',
+                12, details)
+            score += self._contrib_from_series(
+                self._series_crowding('000905.XSHG'),
+                '中证500拥挤度(4周)' if w else '中证500拥挤度(占全市场%)',
+                16, details)
+            ic = n.get('IC_basis_annual')
+            im = n.get('IM_basis_annual')
+            ser_mix = self._series_ic_im_annual_basis_avg(count=520 if w else 320)
+            _, min_pts = self.calculator._pct_window()
+            if ser_mix is not None and len(ser_mix) >= min_pts:
+                pct, days = self.calculator.percentile_series(ser_mix)
+                score += self._pct_contrib(
+                    pct, days,
+                    'IC+IM年化基差(周线)历史分位' if w else 'IC+IM年化基差(逐日合成)历史分位',
+                    24, details)
+            elif ic is not None and im is not None:
+                details.append(f"IC+IM年化基差当前({(ic+im)/2:.2f}%): 历史序列不足，未打分位")
             else:
-                details.append(f"中盘拥挤度正常({crowding_500:.1f}%): 0")
-            
-            # 市场形态 (10%) - 哑铃型/纺锤型判断
-            # 哑铃型：两头（大盘+小盘）强于中间（中盘），风格分化大，对冲难度↑
-            # 纺锤型：中间（中盘）强于两头（大盘+小盘），风格集中，对冲难度↓
-            pattern = neutral_indicators.get('market_pattern', '无形态变化')
-            pattern_signal = neutral_indicators.get('pattern_signal', 0)
-            dumbbell_index = neutral_indicators.get('dumbbell_index', 0)
-            
-            if pattern_signal == 1:  # 哑铃型（向上突破）
-                score -= 8
-                details.append(f"哑铃型市场(分化大，对冲难度↑，指数={dumbbell_index:.2f}%): -8")
-            elif pattern_signal == -1:  # 纺锤型（向下突破）
-                score += 8
-                details.append(f"纺锤型市场(分化小，对冲难度↓，指数={dumbbell_index:.2f}%): +8")
-            else:
-                details.append(f"无形态变化(指数={dumbbell_index:.2f}%): 0")
-            
+                details.append('IC/IM年化基差: 数据不足')
         except Exception as e:
             details.append(f"评分计算出错: {e}")
-        
-        score = max(0, min(100, score))
-        
-        return {
-            'score': score,
-            'details': details,
-            'level': self._get_level(score),
-            'trend': '→ 持平'
-        }
+        return {'score': self._clamp_score(score), 'details': details, 'level': self._get_level(score), 'trend': '→ 持平'}
+
+    def _series_futures_annual_basis(self, future_code, index_code, count=320):
+        """(期货收-指数收)/指数收，年化基差近似序列（周度为周五对齐后逐周）。"""
+        try:
+            w = self.calculator.weekly
+            if w:
+                df_f = self.calculator.fetcher.get_futures_main_weekly(
+                    future_code, approx_weeks=max(140, count // 5))
+                df_i = self.calculator.fetcher.get_index_weekly(
+                    index_code, approx_weeks=max(140, count // 5))
+            else:
+                df_f = self.calculator.fetcher.get_futures_main_contract(future_code, period=count)
+                df_i = self.calculator.fetcher.get_index_daily(index_code, period=count)
+            if df_f is None or df_i is None or df_f.empty or df_i.empty:
+                return None
+            df_f = df_f.sort_values('日期').set_index('日期')['收盘价']
+            df_i = df_i.sort_values('日期').set_index('日期')['收盘']
+            m = pd.concat([df_f, df_i], axis=1, join='inner').dropna()
+            min_pts = self.calculator._pct_window()[1]
+            if len(m) < min_pts:
+                return None
+            raw = (m.iloc[:, 0] / m.iloc[:, 1] - 1.0) * 100.0 * 4.0
+            return raw.dropna()
+        except Exception:
+            return None
+
+    def _series_ic_im_annual_basis_avg(self, count=320):
+        s_ic = self._series_futures_annual_basis('IC', '000905.XSHG', count)
+        s_im = self._series_futures_annual_basis('IM', '000852.XSHG', count)
+        if s_ic is None or s_im is None:
+            return None
+        m = pd.concat([s_ic, s_im], axis=1, join='inner').dropna()
+        min_pts = self.calculator._pct_window()[1]
+        if m.empty or len(m) < min_pts:
+            return None
+        return ((m.iloc[:, 0] + m.iloc[:, 1]) / 2.0)
     
     def _get_level(self, score):
         """根据分数获取适配环境等级"""
@@ -1623,11 +1422,15 @@ class StrategyScorer:
 class ExcelReportGenerator:
     """Excel报告生成类"""
     
-    def __init__(self, output_path=None):
+    def __init__(self, output_path=None, observation_end_date=None, run_time_str=None, weekly=True):
+        self.observation_end_date = observation_end_date
+        self.run_time_str = run_time_str or dt.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        self.weekly = weekly
         if output_path is None:
             timestamp = dt.datetime.now().strftime('%Y%m%d_%H%M%S')
             # 聚宽环境中使用当前目录
-            self.output_path = f'strategy_monitor_report_{timestamp}.xlsx'
+            tag = 'weekly' if weekly else 'daily'
+            self.output_path = 'strategy_monitor_{}_{}.xlsx'.format(tag, timestamp)
         else:
             self.output_path = output_path
     
@@ -1654,12 +1457,14 @@ class ExcelReportGenerator:
         """创建总览sheet"""
         ws = wb.create_sheet("策略评分总览", 0)
         
-        ws['A1'] = '策略环境监测报告'
+        title = '策略环境监测报告（周度）' if self.weekly else '策略环境监测报告（日度）'
+        ws['A1'] = title
         ws['A1'].font = Font(bold=True, size=16, color='1F4E78')
         ws.merge_cells('A1:E1')
         ws['A1'].alignment = Alignment(horizontal='center', vertical='center')
         
-        ws['A2'] = f'生成时间: {dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")}'
+        obs = self.observation_end_date or ''
+        ws['A2'] = '观测数据截止: {}  |  报告生成: {}'.format(obs, self.run_time_str)
         ws['A2'].font = Font(size=10, color='666666')
         ws.merge_cells('A2:E2')
         
@@ -1717,6 +1522,7 @@ class ExcelReportGenerator:
     def _create_subjective_sheet(self, wb, indicators):
         """创建主观多头指标sheet"""
         ws = wb.create_sheet("主观多头指标")
+        wk = self.weekly
         
         ws['A1'] = '主观多头策略 - 指标详情'
         ws['A1'].font = Font(bold=True, size=14, color='1F4E78')
@@ -1736,8 +1542,9 @@ class ExcelReportGenerator:
         
         row = 4
         
-        # ===== 第一部分：主要指数当日涨跌幅 =====
-        ws.cell(row=row, column=1, value='【主要指数当日涨跌幅】')
+        # ===== 第一部分：主要指数涨跌幅 =====
+        sec_title = '【主要指数周涨跌幅】' if wk else '【主要指数当日涨跌幅】'
+        ws.cell(row=row, column=1, value=sec_title)
         ws.cell(row=row, column=1).font = Font(bold=True, size=11, color='1F4E78')
         ws.merge_cells(f'A{row}:D{row}')
         row += 1
@@ -1746,10 +1553,12 @@ class ExcelReportGenerator:
         for idx_name in index_list:
             ret = indicators.get(f'{idx_name}_daily_return')
             if ret is not None:
-                ws.cell(row=row, column=1, value=f'{idx_name}当日涨跌幅')
+                lbl = '{}周涨跌幅'.format(idx_name) if wk else '{}当日涨跌幅'.format(idx_name)
+                ws.cell(row=row, column=1, value=lbl)
                 ws.cell(row=row, column=2, value=f"{ret}%")
                 ws.cell(row=row, column=3, value='%')
-                ws.cell(row=row, column=4, value=f'{idx_name}指数当日涨跌幅')
+                desc = '{}指数周涨跌幅（最近一周相对上一周）'.format(idx_name) if wk else '{}指数当日涨跌幅'.format(idx_name)
+                ws.cell(row=row, column=4, value=desc)
                 for col in range(1, 5):
                     cell = ws.cell(row=row, column=col)
                     cell.border = Border(left=Side(style='thin'), right=Side(style='thin'),
@@ -1767,10 +1576,12 @@ class ExcelReportGenerator:
         
         market_amount = indicators.get('market_amount_20d_avg')
         if market_amount is not None:
-            ws.cell(row=row, column=1, value='近20日市场平均成交额')
+            amt_lbl = '近4周上证周均成交额' if wk else '近20日市场平均成交额'
+            amt_desc = '最近一周全市场成交额（亿元）' if wk else '反映市场整体活跃度'
+            ws.cell(row=row, column=1, value=amt_lbl)
             ws.cell(row=row, column=2, value=f"{market_amount:.2f}")
             ws.cell(row=row, column=3, value='亿元')
-            ws.cell(row=row, column=4, value='反映市场整体活跃度')
+            ws.cell(row=row, column=4, value=amt_desc)
             for col in range(1, 5):
                 cell = ws.cell(row=row, column=col)
                 cell.border = Border(left=Side(style='thin'), right=Side(style='thin'),
@@ -1780,10 +1591,12 @@ class ExcelReportGenerator:
         
         amount_change = indicators.get('market_amount_change_20d')
         if amount_change is not None:
-            ws.cell(row=row, column=1, value='近20日成交额变化率')
+            ch_lbl = '上证成交额4周环比' if wk else '近20日成交额变化率'
+            ch_desc = '最近一周成交额相对4周前一周的变化率' if wk else '反映市场热度变化'
+            ws.cell(row=row, column=1, value=ch_lbl)
             ws.cell(row=row, column=2, value=f"{amount_change}%")
             ws.cell(row=row, column=3, value='%')
-            ws.cell(row=row, column=4, value='反映市场热度变化')
+            ws.cell(row=row, column=4, value=ch_desc)
             for col in range(1, 5):
                 cell = ws.cell(row=row, column=col)
                 cell.border = Border(left=Side(style='thin'), right=Side(style='thin'),
@@ -1793,8 +1606,8 @@ class ExcelReportGenerator:
         
         row += 1  # 空行
         
-        # ===== 第三部分：估值指标（PE/PB） =====
-        ws.cell(row=row, column=1, value='【估值指标 - PE/PB分位数】')
+        # ===== 第三部分：估值指标（当前 PE/PB，不含历史分位数） =====
+        ws.cell(row=row, column=1, value='【估值指标 - 当前 PE/PB】')
         ws.cell(row=row, column=1).font = Font(bold=True, size=11, color='1F4E78')
         ws.merge_cells(f'A{row}:D{row}')
         row += 1
@@ -1808,21 +1621,13 @@ class ExcelReportGenerator:
         
         for idx_code, idx_name in index_valuation:
             pe = indicators.get(f'{idx_code}_PE')
-            pe_pct = indicators.get(f'{idx_code}_PE_percentile')
-            pe_days = indicators.get(f'{idx_code}_PE_percentile_days', 0)
             pb = indicators.get(f'{idx_code}_PB')
-            pb_pct = indicators.get(f'{idx_code}_PB_percentile')
-            pb_days = indicators.get(f'{idx_code}_PB_percentile_days', 0)
             
             if pe is not None:
                 ws.cell(row=row, column=1, value=f'{idx_name} PE')
                 ws.cell(row=row, column=2, value=f"{pe:.2f}倍")
-                if pe_pct is not None:
-                    pct_display = f"{pe_pct}% (基于{pe_days}天)" if pe_days > 0 else f"{pe_pct}%"
-                    ws.cell(row=row, column=3, value=pct_display)
-                else:
-                    ws.cell(row=row, column=3, value='数据不足')
-                ws.cell(row=row, column=4, value=f'{idx_name}市盈率及历史分位数')
+                ws.cell(row=row, column=3, value='倍')
+                ws.cell(row=row, column=4, value=f'{idx_name}市盈率（成分加权，当前截面）')
                 for col in range(1, 5):
                     cell = ws.cell(row=row, column=col)
                     cell.border = Border(left=Side(style='thin'), right=Side(style='thin'),
@@ -1833,12 +1638,8 @@ class ExcelReportGenerator:
             if pb is not None:
                 ws.cell(row=row, column=1, value=f'{idx_name} PB')
                 ws.cell(row=row, column=2, value=f"{pb:.2f}倍")
-                if pb_pct is not None:
-                    pct_display = f"{pb_pct}% (基于{pb_days}天)" if pb_days > 0 else f"{pb_pct}%"
-                    ws.cell(row=row, column=3, value=pct_display)
-                else:
-                    ws.cell(row=row, column=3, value='数据不足')
-                ws.cell(row=row, column=4, value=f'{idx_name}市净率及历史分位数')
+                ws.cell(row=row, column=3, value='倍')
+                ws.cell(row=row, column=4, value=f'{idx_name}市净率（成分加权，当前截面）')
                 for col in range(1, 5):
                     cell = ws.cell(row=row, column=col)
                     cell.border = Border(left=Side(style='thin'), right=Side(style='thin'),
@@ -1859,7 +1660,10 @@ class ExcelReportGenerator:
             ws.cell(row=row, column=1, value='成长/价值比价')
             ws.cell(row=row, column=2, value=f"{gv_ratio}%")
             ws.cell(row=row, column=3, value='%')
-            ws.cell(row=row, column=4, value='创业板指与沪深300指数20日收益率差值，反映风格偏好')
+            gv_desc = (
+                '创业板指与沪深300指数近5周收益率差值，反映风格偏好' if wk
+                else '创业板指与沪深300指数20日收益率差值，反映风格偏好')
+            ws.cell(row=row, column=4, value=gv_desc)
             for col in range(1, 5):
                 cell = ws.cell(row=row, column=col)
                 cell.border = Border(left=Side(style='thin'), right=Side(style='thin'),
@@ -1876,6 +1680,7 @@ class ExcelReportGenerator:
     def _create_quant_sheet(self, wb, indicators):
         """创建量化多头指标sheet"""
         ws = wb.create_sheet("量化多头指标")
+        wk = self.weekly
         
         ws['A1'] = '量化多头策略 - 指标详情'
         ws['A1'].font = Font(bold=True, size=14, color='1F4E78')
@@ -1893,17 +1698,17 @@ class ExcelReportGenerator:
                 top=Side(style='thin'), bottom=Side(style='thin')
             )
         
+        roll = '近约4周' if wk else '近20日'
+        div_u = '周' if wk else '天'
         indicator_descriptions = {
-            'market_amount_20d_avg': '近20日市场平均成交额，反映市场活跃度',
-            '沪深300_crowding': '沪深300指数成交额占全市场比例（近20日），反映大盘拥挤度',
-            '中证500_crowding': '中证500指数成交额占全市场比例（近20日），反映中盘拥挤度',
-            '中证1000_crowding': '中证1000指数成交额占全市场比例（近20日），反映小盘拥挤度',
-            'market_divergence_daily': '当日市值加权收益与等权收益的差值，正值表示大盘股跑赢多数个股',
-            'market_divergence_20d': '近20日分化度累计值，持续正值表示一九行情持续',
-            'market_divergence_percentile': '20日累计分化度在近一年中的历史分位数',
-            'market_divergence_percentile_days': '计算分化度分位数所用的历史天数',
-            'yijiu_index': '一九行情综合指数（0-100），越高表示一九行情越明显',
-            'yijiu_level': '一九行情强度等级文字描述'
+            'market_amount_20d_avg': '{}市场平均成交额，反映市场活跃度'.format(roll),
+            '沪深300_crowding': '沪深300指数成交额占全市场比例（{}），反映大盘拥挤度'.format(roll),
+            '中证500_crowding': '中证500指数成交额占全市场比例（{}），反映中盘拥挤度'.format(roll),
+            '中证1000_crowding': '中证1000指数成交额占全市场比例（{}），反映小盘拥挤度'.format(roll),
+            'market_divergence_daily': '市值加权收益与等权收益的差值（{}度），正值表示大盘股跑赢多数个股'.format('周' if wk else '日'),
+            'market_divergence_20d': '{}分化度累计值，持续正值表示一九行情持续'.format('12周' if wk else '近20日'),
+            'market_divergence_percentile': '{}累计分化度在历史分布中的分位数'.format('12周' if wk else '20日'),
+            'market_divergence_percentile_days': '计算分化度分位数所用的历史{}'.format(div_u),
         }
         
         indicator_units = {
@@ -1914,18 +1719,14 @@ class ExcelReportGenerator:
             'market_divergence_daily': '%',
             'market_divergence_20d': '%',
             'market_divergence_percentile': '%',
-            'market_divergence_percentile_days': '天',
-            'yijiu_index': '分',
-            'yijiu_level': ''
+            'market_divergence_percentile_days': div_u,
         }
         
-        # 按逻辑分组显示，先展示原有指标，再展示一九行情指标
         display_order = [
             'market_amount_20d_avg',
             '沪深300_crowding', '中证500_crowding', '中证1000_crowding',
             'market_divergence_daily', 'market_divergence_20d',
             'market_divergence_percentile', 'market_divergence_percentile_days',
-            'yijiu_index', 'yijiu_level'
         ]
         
         row = 4
@@ -1942,19 +1743,6 @@ class ExcelReportGenerator:
                 ws.cell(row=row, column=2, value=value)
                 ws.cell(row=row, column=3, value=indicator_units.get(name, ''))
                 ws.cell(row=row, column=4, value=indicator_descriptions.get(name, ''))
-                
-                # 一九行情指数高亮
-                if name == 'yijiu_index':
-                    yijiu_val = value
-                    if yijiu_val >= 75:
-                        ws.cell(row=row, column=2).fill = PatternFill(
-                            start_color='FF6B6B', end_color='FF6B6B', fill_type='solid')
-                    elif yijiu_val >= 60:
-                        ws.cell(row=row, column=2).fill = PatternFill(
-                            start_color='FFA07A', end_color='FFA07A', fill_type='solid')
-                    elif yijiu_val <= 25:
-                        ws.cell(row=row, column=2).fill = PatternFill(
-                            start_color='90EE90', end_color='90EE90', fill_type='solid')
                 
                 for col in range(1, 5):
                     cell = ws.cell(row=row, column=col)
@@ -1984,16 +1772,18 @@ class ExcelReportGenerator:
         ws.column_dimensions['D'].width = 60
     
     def _create_cta_sheet(self, wb, indicators):
-        """创建CTA策略指标sheet - 仅商品期货 - 优化展示格式"""
+        """CTA：商品主力等权合成（日度/周度与 IndicatorCalculator 一致）"""
         ws = wb.create_sheet("CTA策略指标")
-        
-        ws['A1'] = 'CTA策略 - 商品期货指标详情'
+        wk = self.weekly
+        u = '周' if wk else '日'
+        win_label = '4周滚动' if wk else '20日滚动'
+
+        ws['A1'] = 'CTA策略 - 商品主力等权合成指标'
         ws['A1'].font = Font(bold=True, size=14, color='1F4E78')
         ws.merge_cells('A1:E1')
         ws['A1'].alignment = Alignment(horizontal='center', vertical='center')
-        
-        # 表头
-        headers = ['品种', '指标名称', '当前值', '历史分位数', '单位']
+
+        headers = ['标的', '指标名称', '当前值', '历史分位数', '单位']
         for col, header in enumerate(headers, 1):
             cell = ws.cell(row=3, column=col, value=header)
             cell.font = Font(bold=True, color='FFFFFF')
@@ -2003,169 +1793,53 @@ class ExcelReportGenerator:
                 left=Side(style='thin'), right=Side(style='thin'),
                 top=Side(style='thin'), bottom=Side(style='thin')
             )
-        
+
         row = 4
-        
-        # ===== 第一部分：波动率指标 =====
-        ws.cell(row=row, column=1, value='【波动率指标】')
-        ws.cell(row=row, column=1).font = Font(bold=True, size=11, color='1F4E78')
-        ws.merge_cells(f'A{row}:E{row}')
-        row += 1
-        
-        commodity_symbols = [
-            ('RB', '螺纹钢'), ('CU', '铜'), ('SC', '原油'), 
-            ('M', '豆粕'), ('I', '铁矿石'), ('AU', '黄金')
+        rows_spec = [
+            ('合成指数', '{}年化波动率'.format(win_label), 'commodity_eq_volatility', '%',
+             'commodity_eq_volatility_percentile', 'commodity_eq_volatility_percentile_days'),
+            ('合成指数', '{}均成交量'.format('近4周' if wk else '近20日'), 'commodity_eq_avg_volume', '手',
+             'commodity_eq_volume_percentile', 'commodity_eq_volume_percentile_days'),
+            ('合成指数', '价格水平(归一化后等权收盘)', 'commodity_eq_price_level', '点',
+             'commodity_eq_price_percentile', 'commodity_eq_price_percentile_days'),
+            ('合成指数', '周末/日末总持仓量' if wk else '日末总持仓量', 'commodity_eq_open_interest', '手',
+             'commodity_eq_oi_percentile', 'commodity_eq_oi_percentile_days'),
         ]
-        
-        for symbol, name in commodity_symbols:
-            vol = indicators.get(f'{symbol}_volatility_20d')
-            vol_pct = indicators.get(f'{symbol}_volatility_percentile')
-            vol_days = indicators.get(f'{symbol}_volatility_percentile_days', 0)
-            
-            if vol is not None:
-                ws.cell(row=row, column=1, value=name)
-                ws.cell(row=row, column=2, value='20日年化波动率')
-                ws.cell(row=row, column=3, value=f"{vol}%")
-                if vol_pct is not None:
-                    pct_display = f"{vol_pct}% (基于{vol_days}天)" if vol_days > 0 else f"{vol_pct}%"
-                    ws.cell(row=row, column=4, value=pct_display)
-                else:
-                    ws.cell(row=row, column=4, value='数据不足')
-                ws.cell(row=row, column=5, value='%')
-                
-                for col in range(1, 6):
-                    cell = ws.cell(row=row, column=col)
-                    cell.border = Border(
-                        left=Side(style='thin'), right=Side(style='thin'),
-                        top=Side(style='thin'), bottom=Side(style='thin')
-                    )
-                    cell.alignment = Alignment(horizontal='center', vertical='center')
-                row += 1
-        
-        # 平均波动率
-        avg_vol = indicators.get('commodity_avg_volatility')
-        if avg_vol is not None:
-            ws.cell(row=row, column=1, value='多品种平均')
-            ws.cell(row=row, column=2, value='平均波动率')
-            ws.cell(row=row, column=3, value=f"{avg_vol}%")
-            ws.cell(row=row, column=4, value='-')
-            ws.cell(row=row, column=5, value='%')
+
+        for who, iname, vkey, unit, pkey, dkey in rows_spec:
+            val = indicators.get(vkey)
+            if val is None and indicators.get(pkey) is None:
+                continue
+            ws.cell(row=row, column=1, value=who)
+            ws.cell(row=row, column=2, value=iname)
+            ws.cell(row=row, column=3, value='-' if val is None else val)
+            pct = indicators.get(pkey)
+            nd = indicators.get(dkey, 0)
+            if pct is not None:
+                ws.cell(row=row, column=4, value='{}% (基于{}{})'.format(pct, nd, u))
+            else:
+                ws.cell(row=row, column=4, value='数据不足')
+            ws.cell(row=row, column=5, value=unit)
             for col in range(1, 6):
                 cell = ws.cell(row=row, column=col)
-                cell.border = Border(left=Side(style='thin'), right=Side(style='thin'),
-                                    top=Side(style='thin'), bottom=Side(style='thin'))
+                cell.border = Border(
+                    left=Side(style='thin'), right=Side(style='thin'),
+                    top=Side(style='thin'), bottom=Side(style='thin')
+                )
                 cell.alignment = Alignment(horizontal='center', vertical='center')
-                cell.font = Font(bold=True)
             row += 1
-        
-        row += 1  # 空行
-        
-        # ===== 第二部分：成交量指标 =====
-        ws.cell(row=row, column=1, value='【成交量指标】')
-        ws.cell(row=row, column=1).font = Font(bold=True, size=11, color='1F4E78')
-        ws.merge_cells(f'A{row}:E{row}')
-        row += 1
-        
-        for symbol, name in commodity_symbols:
-            vol = indicators.get(f'{symbol}_avg_volume')
-            vol_pct = indicators.get(f'{symbol}_volume_percentile')
-            vol_days = indicators.get(f'{symbol}_volume_percentile_days', 0)
-            
-            if vol is not None:
-                ws.cell(row=row, column=1, value=name)
-                ws.cell(row=row, column=2, value='近20日平均成交量')
-                ws.cell(row=row, column=3, value=f"{vol:,.0f}")
-                if vol_pct is not None:
-                    pct_display = f"{vol_pct}% (基于{vol_days}天)" if vol_days > 0 else f"{vol_pct}%"
-                    ws.cell(row=row, column=4, value=pct_display)
-                else:
-                    ws.cell(row=row, column=4, value='数据不足')
-                ws.cell(row=row, column=5, value='手')
-                
-                for col in range(1, 6):
-                    cell = ws.cell(row=row, column=col)
-                    cell.border = Border(
-                        left=Side(style='thin'), right=Side(style='thin'),
-                        top=Side(style='thin'), bottom=Side(style='thin')
-                    )
-                    cell.alignment = Alignment(horizontal='center', vertical='center')
-                row += 1
-        
-        # 总成交量
-        total_vol = indicators.get('commodity_total_volume')
-        if total_vol is not None:
-            ws.cell(row=row, column=1, value='多品种合计')
-            ws.cell(row=row, column=2, value='总成交量')
-            ws.cell(row=row, column=3, value=f"{total_vol:,.0f}")
-            ws.cell(row=row, column=4, value='-')
-            ws.cell(row=row, column=5, value='手')
-            for col in range(1, 6):
-                cell = ws.cell(row=row, column=col)
-                cell.border = Border(left=Side(style='thin'), right=Side(style='thin'),
-                                    top=Side(style='thin'), bottom=Side(style='thin'))
-                cell.alignment = Alignment(horizontal='center', vertical='center')
-                cell.font = Font(bold=True)
-            row += 1
-        
-        row += 1  # 空行
-        
-        # ===== 第三部分：持仓量指标 =====
-        ws.cell(row=row, column=1, value='【持仓量指标】')
-        ws.cell(row=row, column=1).font = Font(bold=True, size=11, color='1F4E78')
-        ws.merge_cells(f'A{row}:E{row}')
-        row += 1
-        
-        for symbol, name in commodity_symbols:
-            pos = indicators.get(f'{symbol}_positions')
-            pos_pct = indicators.get(f'{symbol}_positions_percentile')
-            pos_days = indicators.get(f'{symbol}_positions_percentile_days', 0)
-            
-            if pos is not None:
-                ws.cell(row=row, column=1, value=name)
-                ws.cell(row=row, column=2, value='最新持仓量')
-                ws.cell(row=row, column=3, value=f"{pos:,.0f}")
-                if pos_pct is not None:
-                    pct_display = f"{pos_pct}% (基于{pos_days}天)" if pos_days > 0 else f"{pos_pct}%"
-                    ws.cell(row=row, column=4, value=pct_display)
-                else:
-                    ws.cell(row=row, column=4, value='数据不足')
-                ws.cell(row=row, column=5, value='手')
-                
-                for col in range(1, 6):
-                    cell = ws.cell(row=row, column=col)
-                    cell.border = Border(
-                        left=Side(style='thin'), right=Side(style='thin'),
-                        top=Side(style='thin'), bottom=Side(style='thin')
-                    )
-                    cell.alignment = Alignment(horizontal='center', vertical='center')
-                row += 1
-        
-        # 总持仓量
-        total_pos = indicators.get('commodity_total_positions')
-        if total_pos is not None:
-            ws.cell(row=row, column=1, value='多品种合计')
-            ws.cell(row=row, column=2, value='总持仓量')
-            ws.cell(row=row, column=3, value=f"{total_pos:,.0f}")
-            ws.cell(row=row, column=4, value='-')
-            ws.cell(row=row, column=5, value='手')
-            for col in range(1, 6):
-                cell = ws.cell(row=row, column=col)
-                cell.border = Border(left=Side(style='thin'), right=Side(style='thin'),
-                                    top=Side(style='thin'), bottom=Side(style='thin'))
-                cell.alignment = Alignment(horizontal='center', vertical='center')
-                cell.font = Font(bold=True)
-            row += 1
-        
-        # 设置列宽
-        ws.column_dimensions['A'].width = 12
-        ws.column_dimensions['B'].width = 18
+
+        ws.column_dimensions['A'].width = 14
+        ws.column_dimensions['B'].width = 28
         ws.column_dimensions['C'].width = 18
-        ws.column_dimensions['D'].width = 22
+        ws.column_dimensions['D'].width = 24
         ws.column_dimensions['E'].width = 8
-    
+
     def _create_arbitrage_sheet(self, wb, indicators):
         """创建套利策略指标sheet - 优化展示格式"""
         ws = wb.create_sheet("套利策略指标")
+        wk = self.weekly
+        u = '周' if wk else '天'
         
         ws['A1'] = '套利策略 - 指标详情（ETF套利/股指高频套利/期权套利/基差）'
         ws['A1'].font = Font(bold=True, size=14, color='1F4E78')
@@ -2205,10 +1879,11 @@ class ExcelReportGenerator:
             
             if amount is not None:
                 ws.cell(row=row, column=1, value=etf_name)
-                ws.cell(row=row, column=2, value='近20日平均成交额')
+                amt_nm = '近4周平均周成交额' if wk else '近20日平均成交额'
+                ws.cell(row=row, column=2, value=amt_nm)
                 ws.cell(row=row, column=3, value=f"{amount:.2f}")
                 if amount_pct is not None:
-                    pct_display = f"{amount_pct}% (基于{amount_days}天)" if amount_days > 0 else f"{amount_pct}%"
+                    pct_display = f"{amount_pct}% (基于{amount_days}{u})" if amount_days > 0 else f"{amount_pct}%"
                     ws.cell(row=row, column=4, value=pct_display)
                 else:
                     ws.cell(row=row, column=4, value='数据不足')
@@ -2227,10 +1902,11 @@ class ExcelReportGenerator:
             
             if vol is not None:
                 ws.cell(row=row, column=1, value=etf_name)
-                ws.cell(row=row, column=2, value='20日年化波动率')
+                vol_nm = '4周年化波动率' if wk else '20日年化波动率'
+                ws.cell(row=row, column=2, value=vol_nm)
                 ws.cell(row=row, column=3, value=f"{vol}%")
                 if vol_pct is not None:
-                    pct_display = f"{vol_pct}% (基于{vol_days}天)" if vol_days > 0 else f"{vol_pct}%"
+                    pct_display = f"{vol_pct}% (基于{vol_days}{u})" if vol_days > 0 else f"{vol_pct}%"
                     ws.cell(row=row, column=4, value=pct_display)
                 else:
                     ws.cell(row=row, column=4, value='数据不足')
@@ -2240,31 +1916,6 @@ class ExcelReportGenerator:
                     cell.border = Border(left=Side(style='thin'), right=Side(style='thin'),
                                         top=Side(style='thin'), bottom=Side(style='thin'))
                     cell.alignment = Alignment(horizontal='center', vertical='center')
-                row += 1
-            
-            # 折溢价率
-            premium = indicators.get(f'{etf_code}_premium')
-            premium_pct = indicators.get(f'{etf_code}_premium_percentile')
-            premium_days = indicators.get(f'{etf_code}_premium_percentile_days', 0)
-            
-            if premium is not None:
-                ws.cell(row=row, column=1, value=etf_name)
-                ws.cell(row=row, column=2, value='折溢价率')
-                ws.cell(row=row, column=3, value=f"{premium:.4f}%")
-                if premium_pct is not None:
-                    pct_display = f"{premium_pct}% (基于{premium_days}天)" if premium_days > 0 else f"{premium_pct}%"
-                    ws.cell(row=row, column=4, value=pct_display)
-                else:
-                    ws.cell(row=row, column=4, value='数据不足')
-                ws.cell(row=row, column=5, value='%')
-                # 折溢价为负（折价）时标绿色，为正（溢价）时标红色
-                fill_color = 'C6EFCE' if premium < 0 else 'FFC7CE'
-                for col in range(1, 6):
-                    cell = ws.cell(row=row, column=col)
-                    cell.border = Border(left=Side(style='thin'), right=Side(style='thin'),
-                                        top=Side(style='thin'), bottom=Side(style='thin'))
-                    cell.alignment = Alignment(horizontal='center', vertical='center')
-                    cell.fill = PatternFill(start_color=fill_color, end_color=fill_color, fill_type='solid')
                 row += 1
         
         row += 1  # 空行
@@ -2287,10 +1938,11 @@ class ExcelReportGenerator:
             
             if vol is not None:
                 ws.cell(row=row, column=1, value=fut_name)
-                ws.cell(row=row, column=2, value='20日年化波动率')
+                vol_nm = '4周年化波动率' if wk else '20日年化波动率'
+                ws.cell(row=row, column=2, value=vol_nm)
                 ws.cell(row=row, column=3, value=f"{vol}%")
                 if vol_pct is not None:
-                    pct_display = f"{vol_pct}% (基于{vol_days}天)" if vol_days > 0 else f"{vol_pct}%"
+                    pct_display = f"{vol_pct}% (基于{vol_days}{u})" if vol_days > 0 else f"{vol_pct}%"
                     ws.cell(row=row, column=4, value=pct_display)
                 else:
                     ws.cell(row=row, column=4, value='数据不足')
@@ -2310,7 +1962,7 @@ class ExcelReportGenerator:
                 ws.cell(row=row, column=1, value=fut_name)
                 ws.cell(row=row, column=2, value='成交额历史分位数')
                 ws.cell(row=row, column=3, value='-')
-                pct_display = f"{amt_pct}% (基于{amt_days}天)" if amt_days > 0 else f"{amt_pct}%"
+                pct_display = f"{amt_pct}% (基于{amt_days}{u})" if amt_days > 0 else f"{amt_pct}%"
                 ws.cell(row=row, column=4, value=pct_display)
                 ws.cell(row=row, column=5, value='%')
                 for col in range(1, 6):
@@ -2344,7 +1996,7 @@ class ExcelReportGenerator:
                 ws.cell(row=row, column=2, value='隐含波动率')
                 ws.cell(row=row, column=3, value=f"{iv}%")
                 if iv_pct is not None:
-                    pct_display = f"{iv_pct}% (基于{iv_days}天)" if iv_days > 0 else f"{iv_pct}%"
+                    pct_display = f"{iv_pct}% (基于{iv_days}{u})" if iv_days > 0 else f"{iv_pct}%"
                     ws.cell(row=row, column=4, value=pct_display)
                 else:
                     ws.cell(row=row, column=4, value='数据不足')
@@ -2413,6 +2065,7 @@ class ExcelReportGenerator:
     def _create_neutral_sheet(self, wb, indicators):
         """创建市场中性策略指标sheet - 优化展示格式"""
         ws = wb.create_sheet("市场中性指标")
+        wk = self.weekly
         
         ws['A1'] = '市场中性策略 - 指标详情'
         ws['A1'].font = Font(bold=True, size=14, color='1F4E78')
@@ -2441,7 +2094,8 @@ class ExcelReportGenerator:
         
         market_amount = indicators.get('market_amount_20d_avg')
         if market_amount is not None:
-            ws.cell(row=row, column=1, value='近20日市场平均成交额')
+            amt_lbl = '近4周市场周均成交额' if wk else '近20日市场平均成交额'
+            ws.cell(row=row, column=1, value=amt_lbl)
             ws.cell(row=row, column=2, value=f"{market_amount:.2f}")
             ws.cell(row=row, column=3, value='亿元')
             ws.cell(row=row, column=4, value='反映市场整体活跃度')
@@ -2470,7 +2124,8 @@ class ExcelReportGenerator:
                 ws.cell(row=row, column=1, value=f'{idx_name}（{idx_type}）')
                 ws.cell(row=row, column=2, value=f"{crowding:.2f}%")
                 ws.cell(row=row, column=3, value='%')
-                ws.cell(row=row, column=4, value=f'{idx_name}成交额/全市场总成交额')
+                roll_desc = '近约4周成交额占全市场比例' if wk else '近20日成交额占全市场比例'
+                ws.cell(row=row, column=4, value='{}；{}'.format(idx_name, roll_desc))
                 for col in range(1, 5):
                     cell = ws.cell(row=row, column=col)
                     cell.border = Border(left=Side(style='thin'), right=Side(style='thin'),
@@ -2530,75 +2185,6 @@ class ExcelReportGenerator:
                     cell.alignment = Alignment(horizontal='left' if col in [1, 4] else 'center', vertical='center')
                     cell.fill = PatternFill(start_color=fill_color, end_color=fill_color, fill_type='solid')
                 row += 1
-        
-        row += 1  # 空行
-        
-        # ===== 第四部分：市场形态指标 =====
-        ws.cell(row=row, column=1, value='【市场形态指标 - 哑铃型/纺锤型】')
-        ws.cell(row=row, column=1).font = Font(bold=True, size=11, color='1F4E78')
-        ws.merge_cells(f'A{row}:D{row}')
-        row += 1
-        
-        # 说明行
-        ws.cell(row=row, column=1, value='说明')
-        ws.cell(row=row, column=1).font = Font(italic=True, color='666666')
-        ws.cell(row=row, column=2, value='哑铃指数=国证2000+沪深300-中证500；>MA5为哑铃型，<MA5为纺锤型')
-        ws.merge_cells(f'B{row}:D{row}')
-        ws.cell(row=row, column=2).font = Font(italic=True, color='666666')
-        row += 1
-        
-        # 哑铃指数
-        dumbbell_index = indicators.get('dumbbell_index')
-        if dumbbell_index is not None:
-            ws.cell(row=row, column=1, value='哑铃指数')
-            ws.cell(row=row, column=2, value=f"{dumbbell_index:.4f}%")
-            ws.cell(row=row, column=3, value='%')
-            ws.cell(row=row, column=4, value='国证2000+沪深300-中证500')
-            for col in range(1, 5):
-                cell = ws.cell(row=row, column=col)
-                cell.border = Border(left=Side(style='thin'), right=Side(style='thin'),
-                                    top=Side(style='thin'), bottom=Side(style='thin'))
-                cell.alignment = Alignment(horizontal='left' if col in [1, 4] else 'center', vertical='center')
-            row += 1
-        
-        # 5日均线
-        dumbbell_ma5 = indicators.get('dumbbell_ma5')
-        if dumbbell_ma5 is not None:
-            ws.cell(row=row, column=1, value='哑铃指数5日均线')
-            ws.cell(row=row, column=2, value=f"{dumbbell_ma5:.4f}%")
-            ws.cell(row=row, column=3, value='%')
-            ws.cell(row=row, column=4, value='过去5个交易日均值')
-            for col in range(1, 5):
-                cell = ws.cell(row=row, column=col)
-                cell.border = Border(left=Side(style='thin'), right=Side(style='thin'),
-                                    top=Side(style='thin'), bottom=Side(style='thin'))
-                cell.alignment = Alignment(horizontal='left' if col in [1, 4] else 'center', vertical='center')
-            row += 1
-        
-        # 市场形态
-        pattern = indicators.get('market_pattern')
-        if pattern is not None:
-            ws.cell(row=row, column=1, value='市场形态')
-            ws.cell(row=row, column=2, value=pattern)
-            ws.cell(row=row, column=3, value='-')
-            if pattern == '哑铃型':
-                desc = '两头强于中间，风格分化大，对冲难度↑'
-                fill_color = 'FFC7CE'  # 红色（不利）
-            elif pattern == '纺锤型':
-                desc = '中间强于两头，风格集中，对冲难度↓'
-                fill_color = 'C6EFCE'  # 绿色（有利）
-            else:
-                desc = '风格不明显，市场环境稳定'
-                fill_color = None
-            ws.cell(row=row, column=4, value=desc)
-            for col in range(1, 5):
-                cell = ws.cell(row=row, column=col)
-                cell.border = Border(left=Side(style='thin'), right=Side(style='thin'),
-                                    top=Side(style='thin'), bottom=Side(style='thin'))
-                cell.alignment = Alignment(horizontal='left' if col in [1, 4] else 'center', vertical='center')
-                if fill_color:
-                    cell.fill = PatternFill(start_color=fill_color, end_color=fill_color, fill_type='solid')
-            row += 1
         
         # 设置列宽
         ws.column_dimensions['A'].width = 22
@@ -2670,14 +2256,14 @@ class ExcelReportGenerator:
 # 主程序 - 聚宽研究环境入口
 # ============================================
 
-def collect_all_indicators():
-    """收集所有策略的指标"""
+def collect_all_indicators(observation_end_date=None, weekly=True):
+    """收集所有策略的指标；observation_end_date 为数据截止日（周度监测用上个周五对齐交易日）。"""
     print("=" * 60)
     print("正在收集各策略指标...")
     print("=" * 60)
     
-    calculator = IndicatorCalculator()
-    all_indicators = {}
+    calculator = IndicatorCalculator(observation_end_date, weekly=weekly)
+    all_indicators = {'_meta': {'observation_end_date': observation_end_date or '', 'weekly': weekly}}
     
     # 1. 主观多头指标
     print("\n[1/7] 收集主观多头指标...")
@@ -2686,26 +2272,23 @@ def collect_all_indicators():
     subjective.update(calculator.get_valuation_indicators())
     all_indicators['subjective'] = subjective
     print(f"  - 市场情绪指标: {len([k for k in subjective.keys() if 'amount' in k])}个")
-    print(f"  - 估值指标: {len([k for k in subjective.keys() if 'percentile' in k])}个")
+    print(f"  - 估值指标(PE/PB): {len([k for k in subjective.keys() if k.endswith('_PE') or k.endswith('_PB')])}个")
     
     # 2. 量化多头指标
     print("\n[2/7] 收集量化多头指标...")
     quant = calculator.get_quant_indicators()
     all_indicators['quant'] = quant
     print(f"  - 拥挤度指标: {len([k for k in quant.keys() if 'crowding' in k])}个")
-    print(f"  - 一九行情指标: {len([k for k in quant.keys() if 'divergence' in k or 'yijiu' in k])}个")
-    yijiu_idx = quant.get('yijiu_index')
-    yijiu_lvl = quant.get('yijiu_level', '')
-    if yijiu_idx is not None:
-        print(f"  - 一九行情指数: {yijiu_idx}分 ({yijiu_lvl})")
+    print(f"  - 分化度相关指标: {len([k for k in quant.keys() if 'divergence' in k])}个")
+    if quant.get('market_divergence_daily') is not None:
+        lbl = '当周' if weekly else '当日'
+        print("  - {}市值加权-等权分化度: {}".format(lbl, quant.get('market_divergence_daily')))
     
     # 3. CTA指标（仅商品期货）
     print("\n[3/7] 收集CTA策略指标（商品期货）...")
     cta = calculator.get_cta_indicators()
     all_indicators['cta'] = cta
-    print(f"  - 商品期货波动率指标: {len([k for k in cta.keys() if 'volatility' in k])}个")
-    print(f"  - 商品期货成交量指标: {len([k for k in cta.keys() if 'volume' in k])}个")
-    print(f"  - 商品期货持仓量指标: {len([k for k in cta.keys() if 'positions' in k])}个")
+    print("  - 商品等权合成相关指标: {}个".format(len(cta)))
     
     # 4. ETF套利指标
     print("\n[4/7] 收集ETF套利指标...")
@@ -2732,13 +2315,13 @@ def collect_all_indicators():
     return all_indicators
 
 
-def calculate_all_scores():
+def calculate_all_scores(observation_end_date=None, weekly=True):
     """计算所有策略评分"""
     print("\n" + "=" * 60)
     print("正在计算策略评分...")
     print("=" * 60)
     
-    scorer = StrategyScorer()
+    scorer = StrategyScorer(observation_end_date, weekly=weekly)
     all_scores = scorer.get_all_scores()
     
     for strategy_name, result in all_scores.items():
@@ -2751,6 +2334,10 @@ def calculate_all_scores():
 
 def generate_report(all_scores, all_indicators):
     """生成控制台报告"""
+    meta = all_indicators.get('_meta') or {}
+    obs = meta.get('observation_end_date')
+    if obs:
+        print("\n观测数据截止日: {}".format(obs))
     print("\n" + "=" * 60)
     print("策略评分总览")
     print("=" * 60)
@@ -2764,23 +2351,33 @@ def generate_report(all_scores, all_indicators):
 # 聚宽研究环境入口函数
 # ============================================
 
-def run_strategy_monitor(output_excel=True, excel_path=None):
+def run_strategy_monitor(output_excel=True, excel_path=None, observation_end_date=None, weekly=True):
     """
-    策略环境监测主函数
+    策略环境监测主函数（默认周度：数据截止到「上个自然周五」对齐的交易日）
     :param output_excel: 是否输出Excel报告
     :param excel_path: Excel文件保存路径，默认自动生成
+    :param observation_end_date: 数据截止日 YYYY-MM-DD；None 且 weekly=True 时自动取上周观测日
+    :param weekly: True 使用周度截止日；False 用 observation_end_date 或当日
     :return: (all_scores, all_indicators, excel_path)
     """
+    run_ts = dt.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    if weekly and observation_end_date is None:
+        observation_end_date = get_weekly_observation_end_date()
+    elif not weekly and observation_end_date is None:
+        observation_end_date = dt.datetime.now().strftime('%Y-%m-%d')
+    
     print("\n" + "=" * 60)
-    print("策略环境监测系统")
-    print(f"运行时间: {dt.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print("策略环境监测系统（周度监测）" if weekly else "策略环境监测系统")
+    print("运行时间: {}".format(run_ts))
+    if observation_end_date:
+        print("观测数据截止日（行情/截面）: {}".format(observation_end_date))
     print("=" * 60)
     
     # 1. 收集所有指标
-    all_indicators = collect_all_indicators()
+    all_indicators = collect_all_indicators(observation_end_date, weekly=weekly)
     
     # 2. 计算所有策略评分
-    all_scores = calculate_all_scores()
+    all_scores = calculate_all_scores(observation_end_date, weekly=weekly)
     
     # 3. 生成控制台报告
     generate_report(all_scores, all_indicators)
@@ -2791,7 +2388,11 @@ def run_strategy_monitor(output_excel=True, excel_path=None):
         print("\n" + "=" * 60)
         print("正在生成Excel报告...")
         print("=" * 60)
-        generator = ExcelReportGenerator(output_path=excel_path)
+        generator = ExcelReportGenerator(
+            output_path=excel_path,
+            observation_end_date=observation_end_date,
+            run_time_str=run_ts,
+            weekly=weekly)
         excel_file_path = generator.generate_excel_report(all_scores, all_indicators)
     
     print("\n" + "=" * 60)
